@@ -32,12 +32,12 @@ I wanted to give a list here of projects and resources that I directly used in w
 - Code Monkey King! https://www.youtube.com/@chessprogramming591
 - And of course: https://www.chessprogramming.org
 
-So yeah, go challenge it on Lichess if it's online. Any time control. Seriously. To prove how serious I am, we'll have a list here of all of the humans who have beaten Vixen. Hoping to fill it up someday.
--
--
--
--
--
+So yeah, go challenge it on Lichess if it's online. 
+Any time control. Seriously. To prove how serious I am, we'll have a list here of all of the humans who have beaten Vixen. Hoping to fill it up someday.
 
+-
+-
+-
+-
   
 And a big thank you to all that listen to me ramble about my nerd stuff all the time. Seriously, thank you.
