@@ -20,12 +20,10 @@ static int DE_BRUIJN_MAGIC_TABLE [] = {
 
 static inline uint64_t set_bit(uint64_t board, int index){
     return board | (uint64_t)1 << index;
-    // return board | (1ULL << index);
 }
 
 static inline bool check_bit(uint64_t board, int index){
     return (board & (uint64_t)1 << index);
-    // return board & (1ULL << index);
 }
 
 
@@ -42,16 +40,6 @@ static inline uint64_t toggle_bit(uint64_t board, int index){
     return board ^ ((uint64_t)1 << index);
 }
 
-// static int bit_count(uint64_t i)
-// {
-//     i = i - ((i >> 1) & 0x5555555555555555ULL);
-//     i = (i & 0x3333333333333333ULL) + ((i >> 2) & 0x3333333333333333ULL);
-//     return (int)((((i + (i >> 4)) & 0xF0F0F0F0F0F0F0FULL) * 0x101010101010101ULL) >> 56);
-// }
-
-// static inline int bit_scan_forward(uint64_t b){
-//     return DE_BRUIJN_MAGIC_TABLE[((uint64_t) ((uint64_t) b & -(uint64_t) b)* DE_BRUIJN_MAGIC) >> 58];
-// }
 static inline int bit_count(uint64_t x) {
     return __builtin_popcountll(x);
 }
@@ -61,12 +49,6 @@ static inline int bit_scan_forward(uint64_t * b){
 static inline int bit_scan_backward(uint64_t * b){
     return __builtin_clzll(*b);
 }
-// static inline uint64_t pop_msb(uint64_t b, int * index){
-//     if (!index) return 0;
-//     *index = bit_scan_forward(b);
-//     // int index = __builtin_ctzll(b);
-//     return toggle_bit(b, *index);
-// }
 
 
 static inline int pop_lsb(uint64_t * b){

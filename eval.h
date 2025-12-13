@@ -13,12 +13,11 @@
 */
 void init_evaluate(Game * game);
 
-/* @brief static exchange evaluation. this is actually the heart of the engine, this controls the moves we let into our qsearch and helps in overall move ordering, by pushing obviously bad captures down. currently about 20% of our call graph */
+/* @brief static exchange evaluation. this controls the moves we let into our qsearch and helps in overall move ordering, by pushing obviously bad captures down. */
 
 // int see(Game *game, Move * move);
 
 static inline int see(Game *game, Move * move) {
-    // if (move->type != CAPTURE && move->promotion_capture != true && move->type != EN_PASSANT) return -1;
     int sq = move->end_index;
     int from = move->start_index;
     PieceType capture_piece = move->capture_piece;
@@ -50,7 +49,6 @@ static inline int see(Game *game, Move * move) {
     while (true) {
         uint64_t att = attackers[side];
         if (!att || depth > 30) break;
-        // if (!att) break;
         
         PieceType lva = (PieceType)0;
         int next_from = lva_from_attacker_mask(temp_pieces[side], att, &lva); 
@@ -95,8 +93,6 @@ static inline uint64_t evaluate_pawn_structure(Game * game, Side side, int * mg,
     int score_mg = 0, score_eg = 0;
 
     // pawns
-    // double phase = (double)game->phase / MAX_PHASE;
-    // double eg_phase = 1.0 - phase;
 
     uint64_t pawns = game->pieces[side][PAWN];
     uint64_t friendly_pawns = game->pieces[side][PAWN];
@@ -119,16 +115,11 @@ static inline uint64_t evaluate_pawn_structure(Game * game, Side side, int * mg,
         bool enemy_pawn_in_front_adjacent = enemy_pawns & adjacent_in_front_masks[side][pos];
         // isolated
         if(!(game->pieces[side][PAWN] & adjacent_file_masks[file])) {
-            // score_mg += weights_mg[params.isolated_pawn[side]];
-            // score_eg += weights_eg[params.isolated_pawn[side]];
             score_mg += ISOLATED_PAWN_PENALTY_MG;
             score_eg += ISOLATED_PAWN_PENALTY_EG;
-            // t_score += texel_weights[params.isolated_pawn_eg] * eg_phase;
         }
         // passers
         if (!(game->pieces[!side][PAWN] & passed_pawn_masks[side][pos]) && !enemy_pawn_on_file) {
-            // score_mg += weights_mg[params.passed_pawn[side]];
-            // score_eg += weights_eg[params.passed_pawn[side]];
             score_mg += PASSED_PAWN_BONUS_MG;
             score_eg += PASSED_PAWN_BONUS_EG;
         }
