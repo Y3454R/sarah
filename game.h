@@ -3,12 +3,154 @@
 
 // #include "move_generation.h"
 // #include "move_generation.h"
+#include "game_old.h"
 #include "magic.h"
 #include "types.h"
 #include "math.h"
+#include "utils.h"
 #include "zobrist.h"
 #include "magic.h"
+#include "eval_constants.h"
+#include <stddef.h>
 // #include "tuner.h"
+
+
+// must be called before making a move
+static inline bool is_double_push(Game * game, Move m){
+    uint8_t from = move_from(m);
+    if (move_type(m) != NORMAL || game->piece_at[from] != PAWN) return false;
+    uint8_t to = move_to(m);
+    if (abs(from - to) == 16) return true;
+    return false;
+}
+
+static inline uint64_t moves_at(Side side, uint8_t sq, PieceType p, uint64_t occ){
+    
+    switch (p){
+        case PAWN:
+            return pawn_captures[side][sq];
+            break;
+        case KNIGHT:
+            return knight_moves[sq];
+            break;
+        case BISHOP:
+            return fetch_bishop_moves(sq, occ);
+            break;
+        case ROOK:
+            return fetch_rook_moves(sq, occ);
+            break;
+        case QUEEN:
+            return fetch_queen_moves(sq, occ);
+            break;
+        case KING:
+            return king_moves[sq];
+            break;
+        default:
+            return 0;
+    }
+}
+
+
+static inline bool move_causes_check(Game * game, Move m){
+    PieceType p = move_piece(game, m);
+
+    MoveType mt = move_type(m);
+    uint8_t from = move_from(m), to = move_to(m);
+    if (bits[to] & game->st->ci.check_sq[p] && mt != PROMOTION) {
+        return true;
+    }
+
+    if ((game->st->ci.blockers_for_king[!game->side_to_move] & bits[from])
+        && !is_aligned(from, to, game->st->k_sq[!game->side_to_move])) {
+        return true;
+    }
+    switch (mt){
+        case NORMAL: break;
+        case ENPASSANT:
+            {
+                uint64_t occ = game->board_pieces[BOTH];
+                occ ^= from;
+                occ |= to;
+                occ ^= pawn_moves[!game->side_to_move][to];
+                return (fetch_rook_moves(game->st->k_sq[!game->side_to_move], occ) & (game->pieces[game->side_to_move][ROOK] | game->pieces[game->side_to_move][QUEEN])) |
+                (fetch_bishop_moves(game->st->k_sq[!game->side_to_move], occ) & (game->pieces[game->side_to_move][BISHOP] | game->pieces[game->side_to_move][QUEEN]));
+            }
+        case CASTLE:
+            {
+                CastleSide cs = (king_end_locations[game->side_to_move][KINGSIDE] == to ? KINGSIDE : QUEENSIDE);
+                uint8_t rfrom = rook_castle_locations[game->side_to_move][cs][START], rto = rook_castle_locations[game->side_to_move][cs][END];
+                return (rook_moves[rto] & game->pieces[!game->side_to_move][KING]) && (fetch_rook_moves(rto, game->board_pieces[BOTH] ^ rfrom ^ from | to | rto) & game->pieces[!game->side_to_move][KING]);
+            }
+            break;
+        case PROMOTION:
+            return moves_at(game->side_to_move, to, move_promotion_type(m), game->board_pieces[BOTH] ^ from) & game->pieces[!game->side_to_move][KING];
+        default: break;
+    }
+
+
+
+    return false;
+}
+
+static inline uint64_t pawn_attacks(Side side, uint64_t bb){
+    
+    uint64_t ra = !side ? (bb << 7 & ~file_masks[7]) : bb >> 9 & ~file_masks[7];
+    uint64_t la = !side ? (bb << 9 & ~file_masks[0]) : bb >> 7 & ~file_masks[0];
+    return ra | la;
+}
+
+static inline uint64_t pawn_pushes(Side side, uint64_t bb, uint64_t occ){
+    
+    uint64_t pushes = !side ? (bb << 8 & ~occ) : bb >> 8 & ~occ;
+    uint64_t double_pushes = !side ? (pushes << 8 & double_push_masks[side] &~occ) : (pushes >> 8 & double_push_masks[side] & ~occ);
+    return pushes | double_pushes;
+}
+
+// we take in a side to determine which enemy sliders for this function, since we don't have an efficient way to infer both color pieces without having extra instructions
+static inline uint64_t slider_blockers(Game * game, Side side, uint64_t sliders, uint8_t sq, uint64_t * pinners){
+
+    uint64_t blockers = 0;
+    *pinners = 0;
+
+    
+    uint64_t p_sliders =
+        rook_moves[sq] & (game->pieces[side][QUEEN] | game->pieces[side][ROOK]) |
+        bishop_moves[sq] & (game->pieces[side][QUEEN] | game->pieces[side][BISHOP]) & sliders;
+    
+    uint64_t occ = game->board_pieces[BOTH] ^ p_sliders;
+    while (p_sliders){
+        int pos = __builtin_ctzll(p_sliders);
+        p_sliders = p_sliders & (p_sliders - 1);
+        uint64_t b = between_sq[sq][pos] & occ;
+        if (b && !more_than_one(b)){
+            blockers |= b;
+            if (b & game->board_pieces[!side]){
+                *pinners |= bits[pos];
+            }
+        }
+        
+    }
+
+    return blockers;
+}
+
+static inline void compute_check_info(Game * game, StateInfo * st){
+    
+    assert(st == game->st);
+    st->ci.blockers_for_king[WHITE] = slider_blockers(game, BLACK, game->board_pieces[BLACK], st->k_sq[WHITE], &st->pinners[BLACK]);
+    st->ci.blockers_for_king[BLACK] = slider_blockers(game, WHITE, game->board_pieces[WHITE], st->k_sq[BLACK], &st->pinners[WHITE]);
+    
+    uint8_t ksq = st->k_sq[!game->side_to_move];
+    st->ci.check_sq[PAWN] = pawn_captures[!game->side_to_move][ksq];
+    st->ci.check_sq[KNIGHT] = knight_moves[ksq];
+    st->ci.check_sq[BISHOP] = fetch_bishop_moves(ksq, game->board_pieces[BOTH]);
+    st->ci.check_sq[ROOK] = fetch_rook_moves(ksq, game->board_pieces[BOTH]);
+    st->ci.check_sq[QUEEN] = st->ci.check_sq[BISHOP] | st->ci.check_sq[ROOK];
+    
+    
+}
+
+
 /*
     @brief used to mainly detect checking moves. ordered in roughly the order I would assume to be most efficient 
     @param side the ATTACKING side
@@ -23,13 +165,13 @@ static inline bool is_square_attacked(Game * game, Side side, int index){
     if (knight_moves[index] & game->pieces[side][KNIGHT]) {
         return true;
     }
-    uint64_t bishop_rays = fetch_bishop_moves(game, index, game->board_pieces[BOTH]);
+    uint64_t bishop_rays = fetch_bishop_moves(index, game->board_pieces[BOTH]);
     
     if (bishop_rays & game->pieces[side][BISHOP]) {
         return true;
     }
     
-    uint64_t rook_rays = fetch_rook_moves(game, index, game->board_pieces[BOTH]);
+    uint64_t rook_rays = fetch_rook_moves(index, game->board_pieces[BOTH]);
     
     if (rook_rays & game->pieces[side][ROOK]) {
         return true;
@@ -57,166 +199,125 @@ static inline bool in_check(Game * game, Side side){
 
 }
 
-/* @brief handles polyglot hash key / tt updates, bitboard, and "piece_at[][]" changes. also stores history, and replaces last_move which is used for refutations near the end of the function. */
 
-// void undo_move(Game * game, Move * move);
+static inline void mv_pc(Game * game, Side side, PieceType p, uint8_t from, uint8_t to){
+    game->piece_at[from] = PIECE_NONE;
+    game->piece_at[to] = p;
+    game->piece_index[to] = game->piece_index[from];
+    game->piece_list[side][p][game->piece_index[to]] = to;
+    
+}
 
-static inline void undo_move(Game * game, Move * move){
-
-    Side side = move->side;
-    uint64_t key = game->key;
-    int start = move->start_index;
-    int end = move->end_index;
-    PieceType piece = move->piece;
-    PieceType capture_piece = move->capture_piece;
-    CastleSide castle_side = move->castle_side;
-    PieceType promotion_type = move->promotion_type;
-    int ep_sq = game->en_passant_index;
-    uint64_t * piece_board = &game->pieces[side][piece];
-    uint64_t * side_to_move_pieces = &game->board_pieces[side];
-    uint64_t * other_side_pieces = &game->board_pieces[!side];
-    uint64_t our_pieces = *side_to_move_pieces;
-    uint64_t their_pieces = *other_side_pieces;
+static inline void rm_pc(Game * game, Side side, PieceType p, uint8_t s){
+    uint8_t last_sq = game->piece_list[side][p][--game->piece_count[side][p]];
+    ASSERT(last_sq != SQ_NONE);
+    uint8_t index = game->piece_index[s];
+    game->piece_index[last_sq] = index;
+    game->piece_list[side][p][index] = last_sq;
+    game->piece_list[side][p][game->piece_count[side][p]] = SQ_NONE;
+    game->piece_at[s] = PIECE_NONE;
 
     
+    
+}
+static inline void pt_pc(Game * game, Side side, PieceType p, uint8_t s){
+    game->piece_index[s] = game->piece_count[side][p]++;
+    game->piece_list[side][p][game->piece_index[s]] = s;
+    game->piece_at[s] = p;
+}
 
-    if (move->double_push){
+/* @brief handles polyglot hash key / tt updates, bitboard, and "piece_at[][]" changes. also stores history, and replaces last_move which is used for refutations near the end of the function. */
 
-        // if we made an en passant square, we need to check for the special polyglot square as well
+static inline void undo_move(Game * game, Move m, SearchStack * stack){
 
-        if (game->pieces[!side][PAWN] & pawn_captures[side][ep_sq]){
-            key ^= get_en_passant_random(ep_sq);
-        }
+    Side enemy_side = (Side)game->side_to_move;
+    Side side = (Side)!enemy_side;
+    uint8_t from = move_from(m);
+    uint8_t to = move_to(m);
+    MoveType mt = move_type(m);
+    assert(game->piece_at[from] == PIECE_NONE);
+   PieceType p = game->piece_at[to];
+    PieceType cp = stack->cap_piece;
+    uint8_t id = stack->p_id;
+    uint8_t cap_id = stack->cap_id;
 
-        
-    }
-    switch(move->type){
-        case MOVE:
+    // assert(p == game->piece_at[to] || mt == PROMOTION);
+
+
+    uint64_t * piece_board = &game->pieces[side][p];
+    uint64_t * side_to_move_pieces = &game->board_pieces[side];
+    uint64_t * other_side_pieces = &game->board_pieces[enemy_side];
+    uint64_t our_pieces = *side_to_move_pieces;
+    uint64_t their_pieces = *other_side_pieces;
+    PieceType * piece_at = game->piece_at;
+
+
+    bool cap = cp != PIECE_NONE;
+
+
+    // assert((game->board_pieces[WHITE] & game->board_pieces[BLACK]) == 0);
+
+    switch(mt){
+        case NORMAL:
             {
 
-                uint64_t move_board = (1ULL << start | 1ULL << end);
-                // move piece on its board
+                uint64_t move_board = (bits[from] | bits[to]);
                 *piece_board ^= move_board;
 
-                // move piece on its color's board
                 *side_to_move_pieces ^= move_board;
+                // assert(game->piece_at[from] == PIECE_NONE);
 
+                piece_at[from] = p;
 
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                game->piece_at[start] = piece;
+                mv_pc(game, side, p, to, from);
+                if (cap){
+                    
+                    game->pieces[enemy_side][cp] |= bits[to]; 
+                    *other_side_pieces |= bits[to];
+                    game->phase += phase_values[cp];
+                    ASSERT(piece_at[to] == PIECE_NONE);
+                    piece_at[to] = cp;
 
-                if (piece == PAWN){
-                    game->pawn_key ^= pawn_random[side][start];
-                    game->pawn_key ^= pawn_random[side][end];
+                    pt_pc(game, enemy_side, cp, to);
                 }
-
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][end];
-
                 
-
                 break;
 
             }
-        case CAPTURE:
+        case ENPASSANT:
             {
-
-                uint64_t cap = 1ULL << end;
-                uint64_t move_board = (1ULL << start | cap);
-                // move piece on its board
+                // TODO optimize this by precomputing these bits and literally looking them up in an array, this is unnecessary
+                uint8_t capture_square = to + push_direction[enemy_side] * 8;
+                uint64_t move_board = (bits[from] | bits[to]);
+                uint64_t cap_sq = bits[capture_square];
+                
                 *piece_board ^= move_board;
 
-                // toggle captured piece on its board
-                game->pieces[!side][capture_piece] |= cap; 
+                game->pieces[!side][cp] |= cap_sq;
 
-                // move piece on its color's board
                 *side_to_move_pieces ^= move_board;
 
-                // toggle captured piece on its color's board
-                *other_side_pieces |= cap;
-
-
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                key ^= get_piece_random(capture_piece, (Side)!side, end);
-
+                *other_side_pieces |= cap_sq;
                 
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][end];
-
-                game->psqt_evaluation_mg[!side] += PSQT_MG[!side][capture_piece][end];
-                game->psqt_evaluation_eg[!side] += PSQT_EG[!side][capture_piece][end];
-
-                game->phase += phase_values[capture_piece];
-                
-                game->piece_at[start] = piece;
-                game->piece_at[end] = capture_piece;
-                if (piece == PAWN){
-                    game->pawn_key ^= pawn_random[side][start];
-                    game->pawn_key ^= pawn_random[side][end];
-                }
-                if (capture_piece == PAWN){
-                    game->pawn_key ^= pawn_random[!side][end];
-                    
-                }
-            }
-            break;
-        case EN_PASSANT:
-            {
-                int capture_square = __builtin_ctzll(pawn_moves[!side][end]);
-                uint64_t move_board = (1ULL << start | 1ULL << end);
-                uint64_t cap = 1ULL << capture_square;
-                
-                // move piece on its board
-                *piece_board ^= move_board;
-
-                // this utilizes our precomputed board masks for movement. the en passant square for each side will always have one bit forward, which is the exact bit where our pawn that we are capturing is
-                // we avoid having to check if black / white and just use this mask
-                game->pieces[!side][capture_piece] |= cap;
-
-                // move piece on its color's board
-                *side_to_move_pieces ^= move_board;
-
-                // toggle captured piece on its color's board using the above trick to find it's location
-                *other_side_pieces |= cap;
-                
-
-
-
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                key ^= get_piece_random(capture_piece, (Side)!side, capture_square);
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][end];
-
-                game->psqt_evaluation_mg[!side] += PSQT_MG[!side][capture_piece][capture_square];
-                game->psqt_evaluation_eg[!side] += PSQT_EG[!side][capture_piece][capture_square];
-
-                game->phase += phase_values[capture_piece];
-                game->piece_at[start] = piece;
-                game->piece_at[capture_square] = capture_piece;
-
-                game->pawn_key ^= pawn_random[side][start];
-                game->pawn_key ^= pawn_random[side][end];
-                game->pawn_key ^= pawn_random[!side][capture_square];
+                game->phase += phase_values[cp];
+                piece_at[from] = p;
+                piece_at[to] = PIECE_NONE;
+                piece_at[capture_square] = cp;
 
                     
+                mv_pc(game, side, p, to, from);
+                pt_pc(game, enemy_side, cp, capture_square);
             }
             break;
         case CASTLE:
             {
-                uint64_t move_board = (1ULL << start | 1ULL << end);
+
+                CastleSide cs = (king_end_locations[side][KINGSIDE] == to ? KINGSIDE : QUEENSIDE);
+                uint64_t move_board = (bits[from] | bits[to]);
+                uint8_t rfrom = rook_castle_locations[side][cs][START], rend = rook_castle_locations[side][cs][END];
                 uint64_t cb = 
-                    1ULL << rook_castle_locations[side][castle_side][START] | 1ULL << rook_castle_locations[side][castle_side][END];
+                    bits[rfrom] | bits[rend];
                     
-                // moves king to its final location
                 *piece_board ^= move_board;
 
                 game->pieces[side][ROOK] ^= cb;
@@ -224,141 +325,59 @@ static inline void undo_move(Game * game, Move * move){
                 *side_to_move_pieces ^= cb | move_board;
                 
 
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                key ^= get_piece_random(ROOK, side, rook_castle_locations[side][castle_side][START]);
-                key ^= get_piece_random(ROOK, side, rook_castle_locations[side][castle_side][END]);
 
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][end];
-
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][ROOK][rook_castle_locations[side][castle_side][START]];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][ROOK][rook_castle_locations[side][castle_side][START]];
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][ROOK][rook_castle_locations[side][castle_side][END]];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][ROOK][rook_castle_locations[side][castle_side][END]];
-
-                game->piece_at[start] = piece;
-                game->piece_at[rook_castle_locations[side][castle_side][START]] = ROOK;
+                mv_pc(game, side, p, to, from);
+                mv_pc(game, side, ROOK, rend, rfrom);
             }
             break;
         case PROMOTION:
             {
 
-                uint64_t s = 1ULL << start;
-                uint64_t e = 1ULL << end;
+                uint64_t s = bits[from];
+                uint64_t e = bits[to];
                 
-                *piece_board |= s;
+                game->pieces[side][PAWN] |= s;
 
-                game->pieces[side][promotion_type] ^= e;
+                game->pieces[side][p] ^= e;
 
                 *side_to_move_pieces ^= (s | e);
+                rm_pc(game, side, p, to);
+                pt_pc(game, side, PAWN, from);
 
-
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(promotion_type, side, end);
-                // if a promotion capture, no need to change the end square since we are only replacing
-                if (move->promotion_capture){
+                if (cap){
                    
-                    game->pieces[!side][capture_piece] |= e;
+                    game->pieces[enemy_side][cp] |= e;
                     
                     *other_side_pieces |= e;
                 
 
-                    key ^= get_piece_random(capture_piece, (Side)!side, end);
+                    game->phase += phase_values[cp];
+                    piece_at[to] = cp;
 
-
-                    game->psqt_evaluation_mg[!side] += PSQT_MG[!side][capture_piece][end];
-                    game->psqt_evaluation_eg[!side] += PSQT_EG[!side][capture_piece][end];
-
-                    game->phase += phase_values[capture_piece];
-                    game->piece_at[end] = capture_piece;
-                    if (capture_piece == PAWN){
-                        game->pawn_key ^= pawn_random[side][end];
-                    
-                    }
-                } else {
+                    pt_pc(game, enemy_side, cp, to);
                     
                 }
 
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][promotion_type][end];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][promotion_type][end];
 
-                game->phase -= phase_values[move->promotion_type];
-                game->piece_at[start] = piece;
+                game->phase -= phase_values[p];
+                piece_at[from] = PAWN;
 
-                game->pawn_key ^= pawn_random[side][start];
 
             }
             break;
     }
 
 
-    if (piece == KING){
-
-        int file = start % 8;
-        if (file <= 4){
-            
-            game->king_location_castle_side[side][QUEENSIDE] = true;
-            game->king_location_castle_side[side][KINGSIDE] = false;
-            game->king_location_castle_side[side][BOTHSIDE] = false;
-        } else if (file >= 6){
-            game->king_location_castle_side[side][KINGSIDE] = true;
-            game->king_location_castle_side[side][QUEENSIDE] = false;
-            game->king_location_castle_side[side][BOTHSIDE] = false;
-        } else {
-            game->king_location_castle_side[side][BOTHSIDE] = true;
-            game->king_location_castle_side[side][QUEENSIDE] = false;
-            game->king_location_castle_side[side][KINGSIDE] = false;
-        }
-    }
-
-    if (move->last_en_passant_square != -1){
-        
-        if (pawn_captures[!side][move->last_en_passant_square] & game->pieces[side][PAWN]) {
-        
-            key ^= get_en_passant_random(move->last_en_passant_square);
-        }
-    }
-    
-    game->en_passant_index = move->last_en_passant_square;
-
-    if (game->castle_flags[side][QUEENSIDE] != move->castle_flags[side][QUEENSIDE]){
-        key ^= get_castling_random(side, QUEENSIDE);
-    }
-    if (game->castle_flags[side][KINGSIDE] != move->castle_flags[side][KINGSIDE]){
-        key ^= get_castling_random(side, KINGSIDE);
-    }
-    if (game->castle_flags[!side][QUEENSIDE] != move->castle_flags[!side][QUEENSIDE]){
-        key ^= get_castling_random((Side)!side, QUEENSIDE);
-    }
-    if (game->castle_flags[!side][KINGSIDE] != move->castle_flags[!side][KINGSIDE]){
-        key ^= get_castling_random((Side)!side, KINGSIDE);
-    }
-
-
-    game->castle_flags[side][QUEENSIDE] = move->castle_flags[side][QUEENSIDE];    
-    game->castle_flags[side][KINGSIDE] = move->castle_flags[side][KINGSIDE];    
-    game->castle_flags[!side][QUEENSIDE] = move->castle_flags[!side][QUEENSIDE];    
-    game->castle_flags[!side][KINGSIDE] = move->castle_flags[!side][KINGSIDE];    
-    
-    key ^= get_turn_random();
-
+    stack->current_move = 0;
+    stack->moved_piece = PIECE_NONE;
+    stack->cap_piece = PIECE_NONE;
     game->board_pieces[BOTH] = game->board_pieces[WHITE] | game->board_pieces[BLACK];
-    game->side_to_move = (Side)!game->side_to_move;
+    game->side_to_move = side;
     game->key_history[game->history_count] = 0;
     game->history_count -= 1;
-    Move last_last = game->last_move;
-    game->last_move = game->last_last_move;
+    // game->fifty_move_clock = game->fifty_move_clock_was;
 
-
-    // this move is the move we just played and are undoing.
-    // this data is needed for refutation.
-    game->last_last_move = last_last;
-    game->key = key;
+    game->st = game->st->pst;
     
 }
 
@@ -370,165 +389,162 @@ static inline void undo_move(Game * game, Move * move){
 
 
 // returns if move was valid - if false, undo this move
-static inline bool make_move(Game * game, Move * move){
+static inline bool make_move(Game * game, Move m, StateInfo * st, SearchStack * stack){
 
-    Side side = move->side;
-    PieceType piece = move->piece;
-    PieceType capture_piece = move->capture_piece;
-    int start= move->start_index;
-    int end= move->end_index;
-    int en_passant_index = game->en_passant_index;
-    uint64_t key = game->key;
-    CastleSide castle_side = move->castle_side;
-    int ep_sq = game->en_passant_index;
-    PieceType promotion_type = move->promotion_type;
-    uint64_t * piece_board = &game->pieces[side][piece];
+    
+    memcpy(st, game->st, sizeof(StateInfo));
+    st->pst = game->st;
+    game->st = st;
+    uint64_t k = st->key;
+
+    
+    Side side = game->side_to_move;
+    Side enemy_side = (Side)!side;
+    uint8_t from = move_from(m);
+    uint8_t to = move_to(m);
+    MoveType mt = move_type(m);
+    PieceType p = game->piece_at[from];
+    // assert(p < PIECE_NONE);
+    // assert(p == game->piece_info[game->sq_to_uid[from]].p);
+    // assert(bits[from] & game->pieces[side][p]);
+    PieceType cp = game->piece_at[to];
+    int en_passant_index = st->en_passant_index;
+    uint64_t blockers = game->board_pieces[BOTH];
+    uint64_t * piece_board = &game->pieces[side][p];
     uint64_t * side_to_move_pieces = &game->board_pieces[side];
     uint64_t * other_side_pieces = &game->board_pieces[!side];
-    // move->old_key = game->key;
-    // double phase = (double)game->phase / MAX_PHASE;
-    // double eg_phase = 1.0 - phase;
     uint64_t our_pieces = *side_to_move_pieces;
     uint64_t their_pieces = *other_side_pieces;
+    PieceType * piece_at = game->piece_at;
+    bool dp = false;
+    if (p == PAWN){
+        dp = is_double_push(game, m);
+    }
+
+    bool cap = cp != PIECE_NONE || mt == ENPASSANT;
+
 
 
     if (en_passant_index != -1){
-        if (pawn_captures[!side][en_passant_index] & game->pieces[side][PAWN]) {
+        if (pawn_captures[enemy_side][en_passant_index] & game->pieces[side][PAWN]) {
         
-            key ^= get_en_passant_random(en_passant_index);
+            k ^= get_en_passant_random(en_passant_index);
         }
         
     }
 
     
-    switch(move->type){
-        case MOVE:
+    switch(mt){
+        case NORMAL:
             {
 
-                uint64_t move_board = (1ULL << start | 1ULL << end);
-                // move piece on its board
+
+                uint64_t move_board = (bits[from] | bits[to]);
                 *piece_board ^= move_board;
 
-                // move piece on its color's board
                 *side_to_move_pieces ^= move_board;
 
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
+                piece_at[to] = p;
+                piece_at[from] = PIECE_NONE;
+                
+                st->psqt_score[side] -= PSQT[side][p][from];
+                st->psqt_score[side] += PSQT[side][p][to];
 
-                game->piece_at[end] = piece;
+                if (cap){
+                    
+                    // assert(cp < PIECE_NONE);
+                    game->pieces[enemy_side][cp] ^= bits[to]; 
+                    *other_side_pieces ^= bits[to];
+                    game->phase -= phase_values[cp];
+                    st->psqt_score[enemy_side] -= PSQT[enemy_side][cp][to];
+                    st->material_score[enemy_side] -= eval_params[ep_idx.piece_values[cp]];
+                    blockers ^= bits[from];
 
-                if (piece == PAWN){
-                    game->pawn_key ^= pawn_random[side][start];
-                    game->pawn_key ^= pawn_random[side][end];
+                    k ^= get_piece_random(cp, enemy_side, to);
+                    st->piece_key[cp] ^= piece_random[enemy_side][to];
+
+                    st->material_key ^= material_randoms[enemy_side][cp][game->piece_count[enemy_side][cp]];
+                    rm_pc(game, enemy_side, cp, to);
+                    st->material_key ^= material_randoms[enemy_side][cp][game->piece_count[enemy_side][cp]];
+
+                    if (cp != PAWN){
+                        st->nonpawn_key[enemy_side] ^= piece_random[enemy_side][to];
+                    }
+                } else {
+                    
+                    blockers ^= move_board;
                 }
-                
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][end];
 
+                k ^= get_piece_random(p, side, from);
+                k ^= get_piece_random(p, side, to);
+                st->piece_key[p] ^= piece_random[side][from];
+                st->piece_key[p] ^= piece_random[side][to];
+                if (p == KING){
+                    st->k_sq[side] = to;
+                }
+                if (p != PAWN){
+                    st->nonpawn_key[side] ^= piece_random[side][from];
+                    st->nonpawn_key[side] ^= piece_random[side][to];
+                }
+    
                 
-
-
-                
+                mv_pc(game, side, p, from, to);
                 break;
             }
-        case CAPTURE:
+        case ENPASSANT:
             {
-
-                uint64_t cap = 1ULL << end;
-                uint64_t move_board = (1ULL << start | cap);
-                // move piece on its board
-                *piece_board ^= move_board;
-
-                // toggle captured piece on its board
-                game->pieces[!side][capture_piece] ^= cap; 
-
-                // move piece on its color's board
-                *side_to_move_pieces ^= move_board;
-
-                // toggle captured piece on its color's board
-                *other_side_pieces ^= cap;
-
-
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                key ^= get_piece_random(capture_piece, (Side)!side, end);
-
-
-                game->phase -= phase_values[capture_piece];
-
-                game->piece_at[end] = piece;
-
-                if (piece == PAWN){
-                    game->pawn_key ^= pawn_random[side][start];
-                    game->pawn_key ^= pawn_random[side][end];
-                }
-                if (capture_piece == PAWN){
-                    game->pawn_key ^= pawn_random[!side][end];
-                    
-                }
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][end];
-
-                game->psqt_evaluation_mg[!side] -= PSQT_MG[!side][capture_piece][end];
-                game->psqt_evaluation_eg[!side] -= PSQT_EG[!side][capture_piece][end];
-
-            }
-            break;
-        case EN_PASSANT:
-            {
-                int capture_square = __builtin_ctzll(pawn_moves[!side][end]);
+                uint8_t capture_square = to + push_direction[enemy_side] * 8;
+                cp = PAWN;
+                // assert(game->piece_at[capture_square] == PAWN);
                 
-                uint64_t move_board = (1ULL << start | 1ULL << end);
-                uint64_t cap = 1ULL << capture_square;
-                // move piece on its board
+                uint64_t move_board = (bits[from] | bits[to]);
+                uint64_t cap_board = bits[capture_square];
                 *piece_board ^= move_board;
 
-                // this utilizes our precomputed board masks for movement. the en passant square for each side will always have one bit forward, which is the exact bit where our pawn that we are capturing is
-                // we avoid having to check if black / white and just use this mask
-                game->pieces[!side][capture_piece] ^= cap;
+                game->pieces[enemy_side][cp] ^= cap_board;
 
                 *side_to_move_pieces ^= move_board;
 
-                *other_side_pieces ^= cap;
+                *other_side_pieces ^= cap_board;
+                game->phase -= phase_values[cp];
+
+                piece_at[to] = p;
+                piece_at[from] = PIECE_NONE;
+                piece_at[capture_square] = PIECE_NONE;
 
 
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                key ^= get_piece_random(capture_piece, (Side)!side, capture_square);
+                st->psqt_score[side] -= PSQT[side][p][from];
+                st->psqt_score[side] += PSQT[side][p][to];
+
+                st->psqt_score[enemy_side] -= PSQT[enemy_side][cp][capture_square];
+                st->material_score[enemy_side] -= eval_params[ep_idx.piece_values[cp]];
 
 
-                game->phase -= phase_values[capture_piece];
+                blockers ^= (move_board | cap_board);
 
-                game->piece_at[end] = piece;
+                k ^= get_piece_random(PAWN, enemy_side, capture_square);
+                st->piece_key[PAWN] ^= piece_random[enemy_side][capture_square];
 
-                if (piece == PAWN){
-                    game->pawn_key ^= pawn_random[side][start];
-                    game->pawn_key ^= pawn_random[side][end];
-                }
-                game->pawn_key ^= pawn_random[!side][capture_square];
+                st->material_key ^= material_randoms[enemy_side][cp][game->piece_count[enemy_side][cp]];
+                rm_pc(game, enemy_side, cp, capture_square);
+                st->material_key ^= material_randoms[enemy_side][cp][game->piece_count[enemy_side][cp]];
 
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][end];
 
-                game->psqt_evaluation_mg[!side] -= PSQT_MG[!side][capture_piece][capture_square];
-                game->psqt_evaluation_eg[!side] -= PSQT_EG[!side][capture_piece][capture_square];
-
+                k ^= get_piece_random(p, side, from);
+                k ^= get_piece_random(p, side, to);
+                st->piece_key[p] ^= piece_random[side][from];
+                st->piece_key[p] ^= piece_random[side][to];
+    
+                mv_pc(game, side, p, from, to);
             }
             break;
         case CASTLE:
             {
-                // moves king to its final location
-                // *piece_board = toggle_bit(*piece_board, move.start_index);
-                // *piece_board = set_bit(*piece_board, move.end_index);
-                uint64_t move_board = (1ULL << start | 1ULL << end);
+                CastleSide cs = (king_end_locations[side][KINGSIDE] == to ? KINGSIDE : QUEENSIDE);
+                uint64_t move_board = (bits[from] | bits[to]);
+                uint8_t rfrom = rook_castle_locations[side][cs][START], rend = rook_castle_locations[side][cs][END];
                 uint64_t cb = 
-                    1ULL << rook_castle_locations[side][castle_side][START] | 1ULL << rook_castle_locations[side][castle_side][END];
+                    bits[rfrom] | bits[rend];
 
                 *piece_board ^= move_board;
 
@@ -537,180 +553,176 @@ static inline bool make_move(Game * game, Move * move){
 
                 *side_to_move_pieces ^= cb | move_board;
 
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(piece, side, end);
-                key ^= get_piece_random(ROOK, side, rook_castle_locations[side][castle_side][START]);
-                key ^= get_piece_random(ROOK, side, rook_castle_locations[side][castle_side][END]);
+                st->psqt_score[side] -= PSQT[side][p][from];
+                st->psqt_score[side] += PSQT[side][p][to];
+                st->psqt_score[side] -= PSQT[side][ROOK][rfrom];
+                st->psqt_score[side] += PSQT[side][ROOK][rend];
 
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][piece][end];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][piece][end];
+                piece_at[to] = p;
+                piece_at[from] = PIECE_NONE;
+                piece_at[rend] = ROOK;
+                piece_at[rfrom] = PIECE_NONE;
 
+                blockers ^= cb | move_board;
 
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][ROOK][rook_castle_locations[side][castle_side][START]];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][ROOK][rook_castle_locations[side][castle_side][START]];
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][ROOK][rook_castle_locations[side][castle_side][END]];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][ROOK][rook_castle_locations[side][castle_side][END]];
+                // king
+                k ^= get_piece_random(p, side, from);
+                k ^= get_piece_random(p, side, to);
+                st->piece_key[p] ^= piece_random[side][from];
+                st->piece_key[p] ^= piece_random[side][to];
+                // assert(st->k_sq[side] == from);
+                st->k_sq[side] = to;
+                st->nonpawn_key[side] ^= piece_random[side][from];
+                st->nonpawn_key[side] ^= piece_random[side][to];
 
-                game->piece_at[end] = piece;
-                game->piece_at[rook_castle_locations[side][castle_side][END]] = ROOK;
-
-
+                // rook
+                k ^= get_piece_random(ROOK, side, rfrom);
+                k ^= get_piece_random(ROOK, side, rend);
+                st->piece_key[ROOK] ^= piece_random[side][rfrom];
+                st->piece_key[ROOK] ^= piece_random[side][rend];
+                st->nonpawn_key[side] ^= piece_random[side][rfrom];
+                st->nonpawn_key[side] ^= piece_random[side][rend];
+    
+                mv_pc(game, side, p, from, to);
+                mv_pc(game, side, ROOK, rfrom, rend);
+                
 
             }
             break;
         case PROMOTION:
             {
 
-                uint64_t s = 1ULL << start;
-                uint64_t e = 1ULL << end;
+                // assert(p == PAWN);
+                uint64_t s = bits[from];
+                uint64_t e = bits[to];
+                PieceType promo = move_promotion_type(m);
+                // assert(promo < PIECE_NONE);
                 
                 *piece_board ^= s;
 
-                game->pieces[side][promotion_type] |= e;
+                game->pieces[side][promo] |= e;
 
                 *side_to_move_pieces ^= (s | e);
+                blockers ^= (s | e);
 
-
-                key ^= get_piece_random(piece, side, start);
-                key ^= get_piece_random(promotion_type, side, end);
-                // if a promotion capture, no need to change the end square since we are only replacing
-                if (move->promotion_capture){
+                if (cap){
                     
-                    game->pieces[!side][capture_piece] ^= e;                    
+                    // assert(cp < PIECE_NONE);
+                    // assert(e & game->pieces[!side][cp]);
+                    // assert(cp == game->piece_info[game->sq_to_uid[to]].p);
+                    game->pieces[enemy_side][cp] ^= e;                    
                     *other_side_pieces ^= e;
+                    blockers ^= e;
                 
-                    key ^= get_piece_random(capture_piece, (Side)!side, end);
-                    game->psqt_evaluation_mg[!side] -= PSQT_MG[!side][capture_piece][end];
-                    game->psqt_evaluation_eg[!side] -= PSQT_EG[!side][capture_piece][end];
+                    st->psqt_score[enemy_side] -= PSQT[enemy_side][cp][to];
+                    st->material_score[enemy_side] -= eval_params[ep_idx.piece_values[cp]];
 
-                    game->phase -= phase_values[capture_piece];
-                    if (capture_piece == PAWN){
-                        game->pawn_key ^= pawn_random[!side][end];
-                    
-                    }
-                } else {
+                    game->phase -= phase_values[cp];
+                    k ^= get_piece_random(cp, enemy_side, to);
+                    st->piece_key[cp] ^= piece_random[enemy_side][to];
+
+                    st->material_key ^= material_randoms[enemy_side][cp][game->piece_count[enemy_side][cp]];
+                    rm_pc(game, enemy_side, cp, to);
+                    st->material_key ^= material_randoms[enemy_side][cp][game->piece_count[enemy_side][cp]];
+
+                    // a promotion capture cannot capture an enemy pawn as that would be illegal, therefore we do not check for nonpawn update
+
+                    st->nonpawn_key[enemy_side] ^= piece_random[enemy_side][to];
+
                     
                 }
 
-                game->psqt_evaluation_mg[side] -= PSQT_MG[side][piece][start];
-                game->psqt_evaluation_eg[side] -= PSQT_EG[side][piece][start];
-                game->psqt_evaluation_mg[side] += PSQT_MG[side][promotion_type][end];
-                game->psqt_evaluation_eg[side] += PSQT_EG[side][promotion_type][end];
+                st->psqt_score[side] -= PSQT[side][p][from];
+                st->psqt_score[side] += PSQT[side][promo][to];
+                st->material_score[side] -= eval_params[ep_idx.piece_values[p]];
+                st->material_score[side] += eval_params[ep_idx.piece_values[promo]];
 
 
-                game->phase += phase_values[promotion_type];
-                game->piece_at[end] = promotion_type;
+                game->phase += phase_values[promo];
+                piece_at[to] = promo;
+                piece_at[from] = PIECE_NONE;
 
-                game->pawn_key ^= pawn_random[side][start];
+
+                k ^= get_piece_random(p, side, from);
+                k ^= get_piece_random(promo, side, to);
+                st->piece_key[p] ^= piece_random[side][from];
+                st->piece_key[promo] ^= piece_random[side][to];
+
+                st->nonpawn_key[side] ^= piece_random[side][to];
+
+                st->material_key ^= material_randoms[side][p][game->piece_count[side][p]];
+                rm_pc(game, side, p, from);
+                st->material_key ^= material_randoms[side][p][game->piece_count[side][p]];
+
+                st->material_key ^= material_randoms[side][promo][game->piece_count[side][promo]];
+                pt_pc(game, side, promo, to);
+                st->material_key ^= material_randoms[side][promo][game->piece_count[side][promo]];
+                // ASSERT(game->piece_count[side][promo] == __builtin_popcountll(game->pieces[side][promo]));
+    
+
             }
             break;
     }
 
 
-    move->last_en_passant_square = en_passant_index;
-    move->castle_flags[side][QUEENSIDE] = game->castle_flags[side][QUEENSIDE];    
-    move->castle_flags[side][KINGSIDE] = game->castle_flags[side][KINGSIDE];    
-    move->castle_flags[!side][QUEENSIDE] = game->castle_flags[!side][QUEENSIDE];    
-    move->castle_flags[!side][KINGSIDE] = game->castle_flags[!side][KINGSIDE];    
-    
-
-    
-    if (move->double_push){
-        game->en_passant_index = -push_direction[side] * 8 + end;
+    if (dp){
+        st->en_passant_index = -push_direction[side] * 8 + to;
         // if we create an en passant square, we need to check for the special polyglot square as well
 
-        if (game->pieces[!side][PAWN] & pawn_captures[side][game->en_passant_index]){
-            key ^= get_en_passant_random(game->en_passant_index);
+        if (game->pieces[enemy_side][PAWN] & pawn_captures[side][st->en_passant_index]){
+            k ^= get_en_passant_random(st->en_passant_index);
         }
 
         
     } else {
-        game->en_passant_index = -1;
-    }
-    
-
-
-    if (piece == KING){
-
-        int file = end % 8;
-        if (file <= 4){
-            
-            game->king_location_castle_side[side][QUEENSIDE] = true;
-            game->king_location_castle_side[side][KINGSIDE] = false;
-            game->king_location_castle_side[side][BOTHSIDE] = false;
-        } else if (file >= 6){
-            game->king_location_castle_side[side][KINGSIDE] = true;
-            game->king_location_castle_side[side][QUEENSIDE] = false;
-            game->king_location_castle_side[side][BOTHSIDE] = false;
-        } else {
-            game->king_location_castle_side[side][BOTHSIDE] = true;
-            game->king_location_castle_side[side][QUEENSIDE] = false;
-            game->king_location_castle_side[side][KINGSIDE] = false;
-        }
+        st->en_passant_index = -1;
     }
 
-    
-    
-    if (move->end_index == rook_starting_locations[!side][QUEENSIDE]){
+    uint8_t cr = castling_rights_masks[from] | castling_rights_masks[to];
 
-        // if we had a flag here, we need to zobrist hash it changing
-        if (game->castle_flags[!side][QUEENSIDE] == true){
-            key ^= get_castling_random((Side)!side, QUEENSIDE);
-        }
-
+    uint8_t ct = cr & st->castle_flags;
+    while (ct){
+        uint8_t c = __builtin_ctz(ct);
+        ct = ct & (ct - 1);
+        k ^= Random64[CASTLING_OFFSET + c];
         
-        game->castle_flags[!side][QUEENSIDE] = false;
     }
-    if (move->end_index == rook_starting_locations[!side][KINGSIDE]){
-        
-        if (game->castle_flags[!side][KINGSIDE] == true){
-            key ^= get_castling_random((Side)!side, KINGSIDE);
-        }
-        
-        game->castle_flags[!side][KINGSIDE] = false;
-    }
+    st->castle_flags &= ~cr;
     
-    if (move->loses_rights){
-        switch(move->rights_toggle){
-            case QUEENSIDE:
-                if (game->castle_flags[side][QUEENSIDE]){
-                    key ^= get_castling_random(side, QUEENSIDE);
-                }
-                game->castle_flags[side][QUEENSIDE] = false;
-                break;
-            case KINGSIDE:
-                if (game->castle_flags[side][KINGSIDE]){
-                    key ^= get_castling_random(side, KINGSIDE);
-                }
-                game->castle_flags[side][KINGSIDE] = false;
-                break;
-            case BOTHSIDE:
-                if (game->castle_flags[side][QUEENSIDE]){
-                    key ^= get_castling_random(side, QUEENSIDE);
-                }
-                if (game->castle_flags[side][KINGSIDE]){
-                    key ^= get_castling_random(side, KINGSIDE);
-                }
-                game->castle_flags[side][QUEENSIDE] = false;
-                game->castle_flags[side][KINGSIDE] = false;
-                break;
-        
-            default:
-                break;
-        }
-    }
+    stack->current_move = m;
+    stack->moved_piece = p;
+    stack->cap_piece = cp;
+    k ^= get_turn_random();
+    st->key = k;
+    game->board_pieces[BOTH] = blockers;
+    game->side_to_move = enemy_side;
 
-    key ^= get_turn_random();
-    game->board_pieces[BOTH] = game->board_pieces[WHITE] | game->board_pieces[BLACK];
-    game->side_to_move = (Side)!game->side_to_move;
-
-    game->key_history[game->history_count] = key;
-    game->key = key;
-    game->last_last_move = game->last_move;
-    game->last_move = *move;
+    game->key_history[game->history_count] = k;
     game->history_count += 1;
+    
+
+    game->fifty_move_clock_was = game->fifty_move_clock;
+    if (p == PAWN || cap){
+        st->rule50 = 0;        
+    } else {
+        st->rule50 = st->pst->rule50 + 1;        
+    }
+    // assert((game->board_pieces[WHITE] & game->board_pieces[BLACK]) == 0);
+    // if(!check_hash(game)){
+    //     printf("HASH WRONG: %lx\n", game->st->key);
+    //     printf("CORRECT: %lx\n", create_zobrist_from_scratch(game));
+    // }
+    // ASSERT(check_hash(game));
+    // ASSERT(game->st->material_key == create_material_hash_from_scratch(game));
+    // for (int i = 0; i < PIECE_TYPES;i++){
+    //     ASSERT(game->st->piece_key[i] == create_piece_hash_from_scratch(game, (PieceType)i));
+    // }
+
+
+
+    // precompute checking info
+    
+    compute_check_info(game, st);
     
     return !in_check(game, side);
 }
@@ -738,50 +750,8 @@ int set_board_to_fen(Game * game, char fen[MAX_FEN]);
 static inline void swap_move(Move *a, Move *b){
     Move t = *a; *a = *b; *b = t;
 }
-static inline void selection_extract_best(Move move_list[], int move_count, int start){
-    int best = start;
-    int best_score = move_list[start].score;
-    for (int i = start + 1; i < move_count; ++i){
-        if (move_list[i].score > best_score){
-            best_score = move_list[i].score;
-            best = i;
-        }
-    }
-    if (best != start) swap_move(&move_list[start], &move_list[best]);
-}
-
-/* @brief efficient sort for swapping moves. using a "movepicker" would probably be faster though */
-
-static void partial_selection_sort(Move move_list[], int move_count, int K){
-    if (move_count <= 1) return;
-    int limit = K < move_count ? K : move_count;
-    for (int i = 0; i < limit; ++i){
-        selection_extract_best(move_list, move_count, i);
-    }
-}
 
 
-/* @brief a quiet move is a noncapture, nonpromoting, and nonchecking move. unlike other engines, we also include "good quiets" sometimes in qsearch. see movegen */
-static inline bool move_is_quiet(Game * game, Move * move){
-
-  if (move->type == CAPTURE) {
-
-    return false;
-
-  } else if (move->type == PROMOTION){
-
-    return false;
-    
-  } else if (move->is_checking){
-      
-    return false;
-  } else if (move->type == EN_PASSANT){
-    return false;
-  } else {
-      return true;
-  }
-  
-}
 
 /* @brief checks against our hash key history to avoid drawing when we are up in material. if we are down in eval, then our engine naturally plays to draw on purpose. */
 
@@ -790,40 +760,68 @@ static inline bool three_fold_repetition(Game * game, uint64_t key){
     for (int i = 0; i < game->history_count; i++){
         if (key == game->key_history[i]){
             count += 1;
+        }
+    }
+    if (count >= 3){
+        return true;
+    }
+    return false;
+}
+
+static inline void dump_stack_moves(SearchStack * stack, int ply){
+    for (int i = 0; i < ply; i++){
+        print_move_full(stack[i].current_move);
+    }
+}
+static inline void dump_state_keys(const StateInfo * st){
+    
+    const StateInfo* cur = st;
+    int count = 0;
+
+    for (const StateInfo* s = st; s; s = s->pst) {
+        printf("%d: %lx\n", count, s->key);
+        count++;
+    }
+}
+
+static inline bool threefold(const StateInfo* st) {
+    const StateInfo* cur = st;
+    int count = 0;
+
+    for (const StateInfo* s = st->pst; s; s = s->pst) {
+
+        if (s->key == cur->key) {
+            count++;
             if (count >= 2){
                 return true;
+                
             }
         }
     }
+
     return false;
 }
 
+static inline bool three_fold_repetition_root(Game * game, uint64_t key){
 
-static inline bool move_is_equal(Move * a, Move * b){
-  
-  if (a->start_index == b->start_index && a->end_index == b->end_index && a->type == b->type){
-    if (a->type == PROMOTION){
-      if (a->promotion_type == b->promotion_type){
-        return true;
-      } else {
-        return false;
-      }
-    } else {
-      return true;
+    int count = 0;
+    for (int i = 0; i < game->history_count; i++){
+        if (key == game->key_history[i]){
+            count += 1;
+        }
     }
-  } else {
+    if (count >= 3){
+        return true;
+    }
     return false;
-  }
 }
-
-
 
 
 /* @brief stores pv into the triangular pv table. you can find this implementation from code monkey king / chess programming wiki */
 
-static inline void store_pv(int ply, Move * move, SearchData * search_data) {
+static inline void store_pv(int ply, Move move, SearchData * search_data) {
     if (ply >= 63) return;
-    search_data->pv_table[ply][0] = *move;
+    search_data->pv_table[ply][0] = move;
 
     for (int i = 0; i < search_data->pv_length[ply + 1]; i++) {
         search_data->pv_table[ply][i + 1] = search_data->pv_table[ply + 1][i];
@@ -842,8 +840,8 @@ static inline void store_pv(int ply, Move * move, SearchData * search_data) {
 
 static inline uint64_t piece_is_pinned(Game * game, Side side, int pinned_to_sq){
     uint64_t occ = game->board_pieces[BOTH];
-    uint64_t bishop_rays = fetch_bishop_moves(game, pinned_to_sq, occ);
-    uint64_t rook_rays = fetch_rook_moves(game, pinned_to_sq, occ);
+    uint64_t bishop_rays = fetch_bishop_moves(pinned_to_sq, occ);
+    uint64_t rook_rays = fetch_rook_moves(pinned_to_sq, occ);
     uint64_t our_pieces = game->board_pieces[side];
 
     uint64_t rook_blockers = rook_rays & our_pieces;
@@ -856,13 +854,15 @@ static inline uint64_t piece_is_pinned(Game * game, Side side, int pinned_to_sq)
 
     while (rook_blockers){
         int pos = pop_lsb(&rook_blockers);
-        uint64_t ray = fetch_rook_moves(game, pinned_to_sq, occ ^ (1ULL << pos));
-        if (ray & rooks_and_queens) pinned |= (1ULL << pos);
+        if (game->piece_at[pos] == PAWN) continue;
+        uint64_t ray = fetch_rook_moves(pinned_to_sq, occ ^ (bits[pos]));
+        if (ray & rooks_and_queens) pinned |= (bits[pos]);
     }
     while (bishop_blockers){
         int pos = pop_lsb(&bishop_blockers);
-        uint64_t ray = fetch_bishop_moves(game, pinned_to_sq, occ ^ (1ULL << pos));
-        if (ray & bishops_and_queens) pinned |= (1ULL << pos);
+        if (game->piece_at[pos] == PAWN) continue;
+        uint64_t ray = fetch_bishop_moves(pinned_to_sq, occ ^ (bits[pos]));
+        if (ray & bishops_and_queens) pinned |= (bits[pos]);
     }
 
     return pinned;
@@ -901,15 +901,23 @@ static inline void compute_pin_masks(Game * game, Side side, MovementMasks * mas
 }
 
 /* @brief only used during board setup, simply puts a piece on its board and updates piece_at */
-static inline void set_piece(Game * game, uint64_t * board, PieceType type, int index){
-
-    *board = set_bit(*board, index);    
+static inline void set_piece(Game * game, uint64_t * board, Side side, PieceType type, int index){
+    game->pieces[side][type] |= 1ULL << index;
     game->piece_at[index] = type;
+    game->piece_index[index] = game->piece_count[side][type];
+    game->piece_list[side][type][game->piece_count[side][type]] = index;
+    game->piece_count[side][type] += 1;
 
 }
 
 
+// basically just makes a state for the root node so that we don't dereference garbage
+static inline void init_st(Game * game, StateInfo * st){
 
+    game->st = st;
+    memcpy(st, &game->os, sizeof(StateInfo));
+    compute_check_info(game, st);
+}
 
 
 /* @brief main input loop, commands in types.h, leads to uci input if "uci" is invoked */

@@ -5,44 +5,76 @@
 #include "math.h"
 #include "game.h"
 #include "magic.h"
+#include "utils.h"
 
+static inline void push_move(Move move_list[200], Move move, int * move_index){
+
+    move_list[(*move_index)++] = move;
+    
+}
 /* @brief generates an attack mask from scratch for one side's pieces */
 
-// uint64_t generate_attack_mask(Game * game, Side side);
 
-static inline uint64_t generate_attack_mask(Game * game, Side side){
+static inline uint64_t generate_attack_mask(Game * game, Side side, uint64_t * datk_mask){
     
     uint64_t attacked_squares = 0;
+    uint64_t datk = 0;
 
     uint64_t pawns = game->pieces[side][PAWN];
-    while (pawns){
-        int index = pop_lsb(&pawns);
-        attacked_squares |= pawn_captures[side][index];
-    }
+    uint64_t ra = !side ? (pawns << 7 & ~file_masks[7]) : pawns >> 9 & ~file_masks[7];
+    uint64_t la = !side ? (pawns << 9 & ~file_masks[0]) : pawns >> 7 & ~file_masks[0];
+    datk |= la & ra;
+    attacked_squares |= la | ra;
     uint64_t knights = game->pieces[side][KNIGHT];
     while (knights){
-        int index = pop_lsb(&knights);
+        int index = __builtin_ctzll(knights);
+        knights = knights & (knights - 1);
+        if (attacked_squares & knight_moves[index]){
+            datk |= attacked_squares & knight_moves[index];
+        }
         attacked_squares |= knight_moves[index];
     }
 
     uint64_t bishops = game->pieces[side][BISHOP];
     while (bishops){
-        int index = pop_lsb(&bishops);
-        attacked_squares |= fetch_bishop_moves(game, index, game->board_pieces[BOTH]);
+        int index = __builtin_ctzll(bishops);
+        bishops = bishops & (bishops - 1);
+        uint64_t moves = fetch_bishop_moves(index, game->board_pieces[BOTH]);
+        if (attacked_squares & moves){
+            datk |= attacked_squares & moves;
+        }
+        attacked_squares |= moves;
     }
     uint64_t rooks = game->pieces[side][ROOK];
     while (rooks){
-        int index = pop_lsb(&rooks);
-        attacked_squares |= fetch_rook_moves(game, index, game->board_pieces[BOTH]);
+        int index = __builtin_ctzll(rooks);
+        rooks = rooks & (rooks - 1);
+        uint64_t moves = fetch_rook_moves(index, game->board_pieces[BOTH]);
+        if (attacked_squares & moves){
+            datk |= attacked_squares & moves;
+        }
+        attacked_squares |= moves;
     }
     uint64_t queens = game->pieces[side][QUEEN];
     while (queens){
-        int index = pop_lsb(&queens);
-        attacked_squares |= fetch_queen_moves(game, index, game->board_pieces[BOTH]);
+        int index = __builtin_ctzll(queens);
+        queens = queens & (queens - 1);
+        uint64_t moves = fetch_queen_moves(index, game->board_pieces[BOTH]);
+        if (attacked_squares & moves){
+            datk |= attacked_squares & moves;
+        }
+        attacked_squares |= moves;
     }
     
     int kpos = __builtin_ctzll(game->pieces[side][KING]);
+    uint64_t moves = king_moves[kpos];
+    if (attacked_squares & moves){
+        datk |= attacked_squares & moves;
+    }
     attacked_squares |= king_moves[kpos];
+    if (datk_mask){
+        *datk_mask = datk;
+    }
     
     return attacked_squares;
     
@@ -51,9 +83,9 @@ static inline uint64_t generate_attack_mask(Game * game, Side side){
 
 static inline void generate_movement_masks(Game * game, Side side, MovementMasks * masks){
     
-    
-    masks->our_attack_mask = generate_attack_mask(game, side);
-    masks->enemy_attack_mask = generate_attack_mask(game, (Side)!side);
+    uint64_t fdatk = 0, edatk = 0;
+    masks->our_attack_mask = generate_attack_mask(game, side, &fdatk);
+    masks->enemy_attack_mask = generate_attack_mask(game, (Side)!side, &edatk);
 
     masks->our_attacked_pieces = game->board_pieces[!side] & masks->our_attack_mask;
     masks->enemy_attacked_pieces = game->board_pieces[side] & masks->enemy_attack_mask;
@@ -68,10 +100,10 @@ static inline void generate_movement_masks(Game * game, Side side, MovementMasks
 static inline uint64_t attacker_mask_for_square(Game * game, Side side, uint64_t pieces[PIECE_TYPES], int index, uint64_t occupancy){
 
     uint64_t attackers = 0;
-    uint64_t bishop_rays = fetch_bishop_moves(game, index, occupancy);
+    uint64_t bishop_rays = fetch_bishop_moves(index, occupancy);
     
     attackers |= bishop_rays & pieces[BISHOP];
-    uint64_t rook_rays = fetch_rook_moves(game, index, occupancy);
+    uint64_t rook_rays = fetch_rook_moves(index, occupancy);
     
     attackers |= rook_rays & pieces[ROOK];
     
@@ -86,7 +118,6 @@ static inline uint64_t attacker_mask_for_square(Game * game, Side side, uint64_t
 }
 
 static inline int lva_from_attacker_mask(uint64_t pieces[PIECE_TYPES], uint64_t mask, PieceType * p){
-    if (!mask || !p) return -1;
     
     for (int i = 0; i < PIECE_TYPES; i++){
         uint64_t overlap = mask & pieces[i];
@@ -98,23 +129,6 @@ static inline int lva_from_attacker_mask(uint64_t pieces[PIECE_TYPES], uint64_t 
     return -1;
 }
 
-// static inline int lva_from_attacker_mask(Game * game, uint64_t mask, PieceType * p){
-//     if (!mask || !p) return -1;
-//     *p = (PieceType)KING;
-//     int bp = 0;
-//     while (mask){
-//         int pos = pop_lsb(&mask);
-//         int pt = game->piece_at[pos];
-//         if (*p > pt){
-//             *p = (PieceType)pt;
-//             bp = pos;
-//         }
-//         if (pt == PAWN){
-//             return pos;
-//         }
-//     }
-//     return bp;
-// }
 
 static inline int mva_from_attacker_mask(Game * game, uint64_t pieces[PIECE_TYPES], uint64_t mask, Side side, PieceType * p){
     for (int i = PIECE_TYPES - 1; i >= 0; i++){
@@ -127,518 +141,260 @@ static inline int mva_from_attacker_mask(Game * game, uint64_t pieces[PIECE_TYPE
     return -1;
 }
 
-static inline void push_move(Move move_list[200], Move move, int * move_index){
 
-    move_list[(*move_index)++] = move;
+
+static inline void push_promo(Move move_list[256], uint8_t * move_count, uint8_t start, uint8_t end){
     
-}
-static inline void find_and_push_captures(Game * game, Move move_list[200], int * move_count, Side side, PieceType piece_type, uint64_t captures, int start_index){
-    
-    while (captures){
-        
-        int end_index = pop_lsb(&captures);
-        push_move(move_list, (Move){
-            .start_index = start_index,
-            .end_index = end_index,
-            .type = CAPTURE,
-            .side = side,
-            .piece = piece_type,
-            .capture_piece = game->piece_at[end_index],
-            .double_push = false,
-            .loses_rights = false,
-        }, move_count);
-    }
-    
+    int mc = *move_count;
+    move_list[mc++] = create_promotion(start, end, KNIGHT);
+    move_list[mc++] = create_promotion(start, end, BISHOP);
+    move_list[mc++] = create_promotion(start, end, ROOK);
+    move_list[mc++] = create_promotion(start, end, QUEEN);
+    *move_count = mc;
 }
 
-/* @brief an experimental idea to let in certain good quiet moves into qsearch and push them higher in main search move ordering.
-it currently has moves that attack enemy hanging pieces or defends our attacking pieces, or attacks a piece we already attack.
-@param next_attack_mask the attack mask from the end position of the move */
 
-static inline bool evaluate_good_quiet(MovementMasks * masks, uint64_t next_attack_mask){
-
-    // if (next_attack_mask & masks->our_attacked_pieces){
-    //     return true;
-    // }
-
-    // if (next_attack_mask & masks->our_hanging_pieces){
-    //     return true;
-    // }
-    // if (next_attack_mask & masks->enemy_hanging_pieces){
-    //     return true;
-    // }
-    // if (see(game, move) > 0){
-    //     return true;
-    // }
-    return false;
-}
-
-static inline void generate_pawn_moves(Game * game, Move move_list[200], int * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, MovementMasks * masks, bool only_non_quiet){
-
-    // uint64_t * pawn_moves = pawn_moves[side];
-    // uint64_t * pawn_captures = game->pawn_captures[side];
-
+static inline void generate_pawn_moves_new(Game * game, Move move_list[256], uint8_t * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, bool only_non_quiet, bool generate_checks){
+    
     uint64_t pawns = game->pieces[side][PAWN];
     uint64_t blockers = game->board_pieces[BOTH];
-    uint64_t enemy_king = game->pieces[!side][KING];
 
+    uint64_t pushes = !side ? (pawns << 8 & ~blockers) : pawns >> 8 & ~blockers;
+    uint64_t double_pushes = !side ? (pushes << 8 & double_push_masks[side] & ~blockers) : (pushes >> 8 & double_push_masks[side] & ~blockers);
+    uint64_t ra = !side ? (pawns << 7 & ~file_masks[7]) : pawns >> 9 & ~file_masks[7];
+    uint64_t la = !side ? (pawns << 9 & ~file_masks[0]) : pawns >> 7 & ~file_masks[0];
+    uint64_t cap_la = la & potential_captures;
+    uint64_t cap_ra = ra & potential_captures;
     
-    
-    while (pawns){
+    uint64_t promo = pushes & promotion_ranks[side];
+    uint64_t promo_la = cap_la & promotion_ranks[side];
+    uint64_t promo_ra = cap_ra & promotion_ranks[side];
+    pushes &= ~promo;
+    cap_la &= ~promo_la;
+    cap_ra &= ~promo_ra;
 
-        int index = pop_lsb(&pawns);
-        uint64_t moves = pawn_moves[side][index];
-        bool cannot_double_push = false;
-        uint64_t blocker = moves & game->board_pieces[BOTH];
-        if (blocker) cannot_double_push = true;
-        moves ^= blocker;
-            
-        uint64_t en_passant = 0;
-        
-        if (game->en_passant_index != -1) en_passant = 1ULL << game->en_passant_index;
-        uint64_t captures = pawn_captures[side][index] & potential_captures;
-        en_passant &= pawn_captures[side][index];
-        uint64_t promotions = (moves | captures) & promotion_ranks[side];
-        moves &= ~promotions;
-        // this is a working copy to remove our captures from afterwards, since we need our captures during this loop to determine promotion captures
-        uint64_t promotion_copy = promotions;
-        
-        while (promotions){
-            int move_index = pop_lsb(&promotions);
-            bool promotion_capture = 1ULL << move_index & captures;
-            bool checking = (fetch_queen_moves(game, move_index, blockers) & enemy_king);
-            // if (!checking && only_non_quiet) continue;
-
-            PieceType promotion_capture_piece = (PieceType)0;
-
-            bool found_promo_piece = false;
-            if (promotion_capture){
-                promotion_capture_piece = game->piece_at[move_index];
-            }
-
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = PROMOTION,
-                .side = side,
-                .piece = PAWN,
-                .capture_piece = promotion_capture_piece,
-                .promotion_type = KNIGHT,
-                .promotion_capture = promotion_capture,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = PROMOTION,
-                .side = side,
-                .piece = PAWN,
-                .capture_piece = promotion_capture_piece,
-                .promotion_type = BISHOP,
-                .promotion_capture = promotion_capture,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = PROMOTION,
-                .side = side,
-                .piece = PAWN,
-                .capture_piece = promotion_capture_piece,
-                .promotion_type = ROOK,
-                .promotion_capture = promotion_capture,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = PROMOTION,
-                .side = side,
-                .piece = PAWN,
-                .capture_piece = promotion_capture_piece,
-                .promotion_type = QUEEN,
-                .promotion_capture = promotion_capture,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
+    uint8_t mc = *move_count;
+    while (promo){
+        int move_index = __builtin_ctzll(promo);
+        int start = move_index - push_direction[side] * 8;
+        promo = promo & (promo- 1);
+        push_promo(move_list, &mc, start, move_index);
+    }
+    while (promo_la){
+        int move_index = __builtin_ctzll(promo_la);
+        int start = move_index - push_direction[side] * 8 - 1;
+        promo_la = promo_la & (promo_la- 1);
+        push_promo(move_list, &mc, start, move_index);
+    }
+    while (promo_ra){
+        int move_index = __builtin_ctzll(promo_ra);
+        int start = move_index - push_direction[side] * 8 + 1;
+        promo_ra = promo_ra & (promo_ra - 1);
+        push_promo(move_list, &mc, start, move_index);
+    }
+    while (cap_la){
+        uint8_t to = __builtin_ctzll(cap_la);
+        uint8_t start = to - push_direction[side] * 8 - 1;
+        cap_la = cap_la & (cap_la - 1);
+        move_list[mc++] = create_move(start, to, NORMAL);
+    }
+    while (cap_ra){
+        uint8_t to = __builtin_ctzll(cap_ra);
+        uint8_t start = to - push_direction[side] * 8 + 1;
+        cap_ra = cap_ra & (cap_ra - 1);
+        move_list[mc++] = create_move(start, to, NORMAL);
+    }
+    if (game->st->en_passant_index != -1){
+        uint64_t ep = bits[game->st->en_passant_index];
+        if (ep & la){
+            uint8_t to = game->st->en_passant_index;
+            uint8_t from = to - push_direction[side] * 8 - 1;
+            move_list[mc++] = create_move(from, to, ENPASSANT);
         }
-        captures &= ~promotion_copy;
-        // find_and_push_captures(game, move_list, move_count, side, PAWN, captures, index);
-        while (captures){
-        
-            int end_index = pop_lsb(&captures);
-            bool checking = pawn_captures[side][end_index] & enemy_king;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = end_index,
-                .type = CAPTURE,
-                .side = side,
-                .piece = PAWN,
-                .capture_piece = game->piece_at[end_index],
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
-        }
-
-        if (en_passant && !only_non_quiet){
-            bool checking = (pawn_captures[side][game->en_passant_index] & enemy_king);
-            if (!checking && only_non_quiet) continue;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = game->en_passant_index,
-                .type = EN_PASSANT,
-                .side = side,
-                .piece = PAWN,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
-        }
-        // if (only_non_quiet) continue;
-        while (moves){
-            int move_index = pop_lsb(&moves);
-            uint64_t next_attack_mask = pawn_captures[side][move_index];
-            bool checking = (next_attack_mask & enemy_king);
-            bool good_quiet = evaluate_good_quiet(masks, next_attack_mask);
-            
-            if (!checking && !good_quiet && only_non_quiet) continue;
-        
-            if (only_non_quiet) continue;
-            bool double_push = false;
-        
-            if (move_index == double_pushed_pawn_squares[side][index]){
-                double_push = true;
-                if (cannot_double_push) continue;
-            }
-        
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = MOVE,
-                .side = side,
-                .piece = PAWN,
-                .double_push = double_push,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = good_quiet
-            }, move_count);
+        if (ep & ra){
+            uint8_t to = game->st->en_passant_index;
+            uint8_t from = to - push_direction[side] * 8 + 1;
+            move_list[mc++] = create_move(from, to, ENPASSANT);
         }
     }
+    if (only_non_quiet && !generate_checks) {
+        *move_count = mc;    
+        return;
+    }
+    while (pushes){
+        uint8_t to = __builtin_ctzll(pushes);
+        uint8_t from = to - push_direction[side] * 8;
+        pushes = pushes & (pushes - 1);
     
+        move_list[mc++] = create_move(from, to, NORMAL);
+
+    }
+    while (double_pushes){
+        
+        uint8_t to = __builtin_ctzll(double_pushes);
+        uint8_t from = to - push_direction[side] * 16;
+        double_pushes = double_pushes & (double_pushes - 1);
+    
+        move_list[mc++] = create_move(from, to, NORMAL);
+    }
+    *move_count = mc;    
 }
 
-static inline void generate_bishop_moves(Game * game, Move move_list[200], int * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, uint64_t blockers, MovementMasks * masks, bool only_non_quiet){
+
+
+static inline void generate_bishop_moves(Game * game, Move move_list[256], uint8_t * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, uint64_t blockers, bool only_non_quiet, bool generate_checks){
 
     uint64_t bishops = game->pieces[side][BISHOP];
-    // int bishop_count = bit_count(bishops);
-    uint64_t enemy_king = game->pieces[!side][KING];
+    uint8_t mc = *move_count;
     while (bishops){
-        int index = pop_lsb(&bishops);
-        uint64_t moves = fetch_bishop_moves(game, index, blockers);
-        // print_board(moves, BLACK_BISHOP);
+        uint8_t from = __builtin_ctzll(bishops);
+        bishops= bishops& (bishops- 1);
+        uint64_t moves = fetch_bishop_moves(from, blockers);
         uint64_t captures = moves & potential_captures;
 
-        // find_and_push_captures(game, move_list, move_count, side, BISHOP, captures, index);
         while (captures){
-        
-            int end_index = pop_lsb(&captures);
-            bool checking = fetch_bishop_moves(game, end_index, game->board_pieces[BOTH]) & enemy_king;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = end_index,
-                .type = CAPTURE,
-                .side = side,
-                .piece = BISHOP,
-                .capture_piece = game->piece_at[end_index],
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking
-            }, move_count);
+            uint8_t to = __builtin_ctzll(captures);
+            captures = captures & (captures - 1);
+            move_list[mc++] = create_move(from, to, NORMAL);
         }
+        if (only_non_quiet && !generate_checks) continue;
 
         moves &= ~game->board_pieces[BOTH];
         while (moves){
-            int move_index = pop_lsb(&moves);
-            // if (only_non_quiet && !(fetch_bishop_moves(game, move_index, blockers) & enemy_king)) continue;
-            uint64_t next_attack_mask = fetch_bishop_moves(game, move_index, game->board_pieces[BOTH]);
-            bool checking = next_attack_mask & enemy_king;
-            bool good_quiet = evaluate_good_quiet(masks, next_attack_mask);
-            if (only_non_quiet && !checking && !good_quiet) continue;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = MOVE,
-                .side = side,
-                .piece = BISHOP,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking
-            }, move_count);
+            uint8_t to = __builtin_ctzll(moves);
+            moves = moves & (moves - 1);
+
+            move_list[mc++] = create_move(from, to, NORMAL);
         }
             
     }
+    *move_count = mc;
 }
-static inline void generate_rook_moves(Game * game, Move move_list[200], int * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, uint64_t blockers, MovementMasks * masks, bool only_non_quiet){
+static inline void generate_rook_moves(Game * game, Move move_list[256], uint8_t * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, uint64_t blockers, bool only_non_quiet, bool generate_checks){
 
     CastleSide rights_toggle = NONESIDE;
     bool loses_rights = false;
     uint64_t rooks = game->pieces[side][ROOK];
-    uint64_t enemy_king = game->pieces[!side][KING];
+    uint8_t mc = *move_count;
     while (rooks){
-        int index = pop_lsb(&rooks);
-        uint64_t moves = fetch_rook_moves(game, index, blockers);
+        uint8_t from = __builtin_ctzll(rooks);
+        rooks = rooks & (rooks - 1);
+        uint64_t moves = fetch_rook_moves(from, blockers);
         uint64_t captures = moves & potential_captures;
-        if (!only_non_quiet){
-            moves &= ~game->board_pieces[BOTH];
-
-
-            while (moves){
-                int move_index = pop_lsb(&moves);
-                // CastleSide rights_toggle = QUEENSIDE;
-                // bool loses_rights = false;
-                // if (only_non_quiet && !(fetch_rook_moves(game, move_index, blockers) & enemy_king)) continue;
-                uint64_t next_attack_mask = fetch_rook_moves(game, move_index, game->board_pieces[BOTH]);
-                bool checking = next_attack_mask & enemy_king;
-                bool good_quiet = evaluate_good_quiet(masks, next_attack_mask);
-                if (only_non_quiet && !checking && !good_quiet) continue;
-
-                if (game->castle_flags[side][KINGSIDE] && (index == 63 || index == 7)){
-                    rights_toggle = KINGSIDE;
-                    loses_rights = true;
-                } else if (game->castle_flags[side][QUEENSIDE] && (index == 56 || index == 0)){
-                    rights_toggle = QUEENSIDE;
-                    loses_rights = true;
-                }
-                push_move(move_list, (Move){
-                    .start_index = index,
-                    .end_index = move_index,
-                    .type = MOVE,
-                    .side = side,
-                    .piece = ROOK,
-                    .double_push = false,
-                    .loses_rights = loses_rights,
-                    .rights_toggle = rights_toggle,
-                    .is_checking = checking
-                }, move_count);
-            }
-            
-        }
-
-
         while (captures){
-            int end_index = pop_lsb(&captures);
-            if (game->castle_flags[side][KINGSIDE] && (index == 63 || index == 7)){
-                rights_toggle = KINGSIDE;
-                loses_rights = true;
+            uint8_t to = __builtin_ctzll(captures);
+            captures = captures & (captures - 1);
 
-            } else if (game->castle_flags[side][QUEENSIDE] && (index == 56 || index == 0)){
-                rights_toggle = QUEENSIDE;
-                loses_rights = true;
-            }
-            bool checking = fetch_rook_moves(game, end_index, game->board_pieces[BOTH]) & enemy_king;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = end_index,
-                .type = CAPTURE,
-                .side = side,
-                .piece = ROOK,
-                .capture_piece = game->piece_at[end_index],
-                .double_push = false,
-                .loses_rights = loses_rights,
-                .rights_toggle = rights_toggle,
-                .is_checking = checking
-            }, move_count);
+            move_list[mc++] = create_move(from, to, NORMAL);
+
         }
-
-        
-    }
-}
-
-static inline void generate_queen_moves(Game * game, Move move_list[200], int * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, uint64_t blockers, MovementMasks * masks, bool only_non_quiet){
-
-    uint64_t queens = game->pieces[side][QUEEN];
-    uint64_t enemy_king = game->pieces[!side][KING];
-    while (queens){
-        int index = pop_lsb(&queens);
-        uint64_t moves = fetch_queen_moves(game, index, blockers);
-        uint64_t captures = moves & potential_captures;
-        // find_and_push_captures(game, move_list, move_count, side, QUEEN, captures, index);
-        while (captures){
-        
-            int end_index = pop_lsb(&captures);
-            bool checking = fetch_queen_moves(game, end_index, game->board_pieces[BOTH]) & enemy_king;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = end_index,
-                .type = CAPTURE,
-                .side = side,
-                .piece = QUEEN,
-                .capture_piece = game->piece_at[end_index],
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
-        }
-        // if (only_non_quiet) continue;
+        if (only_non_quiet && !generate_checks) continue;
         moves &= ~game->board_pieces[BOTH];
 
 
         while (moves){
-            int move_index = pop_lsb(&moves);
-            // if (only_nonquiet && !(fetch_queen_moves(game, move_index, blockers) & enemy_king)) continue;
-            uint64_t next_attack_mask = fetch_queen_moves(game, move_index, game->board_pieces[BOTH]);
-            bool checking = next_attack_mask & enemy_king;
-            bool good_quiet = evaluate_good_quiet(masks, next_attack_mask);
-            if (only_non_quiet && !checking && !good_quiet) continue;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = MOVE,
-                .side = side,
-                .piece = QUEEN,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = good_quiet
-            }, move_count);
+            uint8_t to = __builtin_ctzll(moves);
+            moves = moves & (moves - 1);
+
+            move_list[mc++] = create_move(from, to, NORMAL);
+        }
+        
+    }
+    *move_count = mc;
+}
+
+static inline void generate_queen_moves(Game * game, Move move_list[256], uint8_t * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, uint64_t blockers, bool only_non_quiet, bool generate_checks){
+
+    uint64_t queens = game->pieces[side][QUEEN];
+    uint8_t mc = *move_count;
+    while (queens){
+        uint8_t from = __builtin_ctzll(queens);
+        queens = queens & (queens - 1);
+        uint64_t moves = fetch_queen_moves(from, blockers);
+        uint64_t captures = moves & potential_captures;
+        while (captures){
+        
+            int to = __builtin_ctzll(captures);
+            captures = captures & (captures - 1);
+            move_list[mc++] = create_move(from, to, NORMAL);
+        }
+        if (only_non_quiet && !generate_checks) continue;
+        moves &= ~game->board_pieces[BOTH];
+
+
+        while (moves){
+            uint8_t to = __builtin_ctzll(moves);
+            moves = moves & (moves - 1);
+            move_list[mc++] = create_move(from, to, NORMAL);
         }
             
     }
+    *move_count = mc;
 }
 
-static inline void generate_king_moves(Game * game, Move move_list[200], int * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, MovementMasks * masks, bool only_non_quiet){
+static inline void generate_king_moves(Game * game, Move move_list[256], uint8_t * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, bool only_non_quiet){
 
 
     uint64_t kings = game->pieces[side][KING];
-    bool loses_rights = false;
-    CastleSide rights_toggle = NONESIDE;
-    if (game->castle_flags[side][KINGSIDE] && game->castle_flags[side][QUEENSIDE]){
-        loses_rights = true;
-        rights_toggle = BOTHSIDE;
-    } else if (game->castle_flags[side][KINGSIDE]){
-        loses_rights = true;
-        rights_toggle = KINGSIDE;
-    } else if (game->castle_flags[side][QUEENSIDE]){
-        loses_rights = true;
-        rights_toggle = QUEENSIDE;
+
+    uint8_t from = __builtin_ctzll(kings);
+
+    uint64_t moves = king_moves[from];
+    moves &= ~own_pieces;
+    uint64_t captures = moves & potential_captures;
+    moves &= ~captures;
+    uint8_t mc = *move_count;
+
+    while (captures){
+        uint8_t to = __builtin_ctzll(captures);
+        captures = captures & (captures - 1);
+        move_list[mc++] = create_move(from, to, NORMAL);
     }
+    if (only_non_quiet){
+        *move_count = mc; return;
+    }
+    while (moves){
 
-        int index = __builtin_ctzll(kings);
+        uint8_t to = __builtin_ctzll(moves);
+        moves = moves & (moves - 1);
 
-        uint64_t moves = king_moves[index];
-        moves &= ~own_pieces;
-        uint64_t captures = moves & potential_captures;
-        moves &= ~captures;
-
-        while (moves){
-    
-            int move_index = pop_lsb(&moves);
-        
-            bool good_quiet = evaluate_good_quiet(masks,  king_moves[move_index]);
-            if (only_non_quiet && !good_quiet) continue;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = MOVE,
-                .side = side,
-                .piece = KING,
-                .double_push = false,
-                .loses_rights = loses_rights,
-                .rights_toggle = rights_toggle,
-                .is_checking = false, 
-                .good_quiet = good_quiet
-            }, move_count);
-            
-        }
-        while (captures){
-            int end_index = pop_lsb(&captures);
-            
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = end_index,
-                .type = CAPTURE,
-                .side = side,
-                .piece = KING,
-                .capture_piece = game->piece_at[end_index],
-                .double_push = false,
-                .loses_rights = loses_rights,
-                .rights_toggle = rights_toggle,
-                .is_checking = false, 
-                .good_quiet = false
-            }, move_count);
-        }
+        move_list[mc++] = create_move(from, to, NORMAL);
+    }
+    *move_count = mc;
     
 }
 
-static inline void generate_knight_moves(Game * game, Move move_list[200], int * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, MovementMasks * masks, bool only_non_quiet){
+static inline void generate_knight_moves(Game * game, Move move_list[256], uint8_t * move_count, Side side, uint64_t potential_captures, uint64_t own_pieces, bool only_non_quiet, bool generate_checks){
     
     uint64_t knights = game->pieces[side][KNIGHT];
-    uint64_t enemy_king = game->pieces[!side][KING];
+    int mc = *move_count;
     while (knights){
 
-        int index = pop_lsb(&knights);
+        uint8_t from = __builtin_ctzll(knights);
+        knights = knights & (knights - 1);
         
-        uint64_t moves = knight_moves[index];
+        uint64_t moves = knight_moves[from];
         moves &= ~own_pieces;
         uint64_t captures = moves & potential_captures;
-
         moves &= ~captures;
-        // find_and_push_captures(game, move_list, move_count, side, KNIGHT, captures, index);
+
         while (captures){
         
-            int end_index = pop_lsb(&captures);
-            bool checking = knight_moves[end_index]& enemy_king;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = end_index,
-                .type = CAPTURE,
-                .side = side,
-                .piece = KNIGHT,
-                .capture_piece = game->piece_at[end_index],
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = false
-            }, move_count);
+            uint8_t to = __builtin_ctzll(captures);
+            captures = captures & (captures - 1);
+            move_list[mc++] = create_move(from, to, NORMAL);
         }
-        // if (only_non_quiet) continue;
+        if (only_non_quiet && !generate_checks) continue;
         while (moves){
     
-            int move_index = pop_lsb(&moves);
-            // if (only_non_quiet && !(game->knight_moves[move_index] & enemy_king)) continue;
-            bool checking = knight_moves[move_index] & enemy_king;
-            bool good_quiet = evaluate_good_quiet(masks, knight_moves[move_index]);
-            if (only_non_quiet && !checking && !good_quiet) continue;
-            push_move(move_list, (Move){
-                .start_index = index,
-                .end_index = move_index,
-                .type = MOVE,
-                .side = side,
-                .piece = KNIGHT,
-                .double_push = false,
-                .loses_rights = false,
-                .is_checking = checking,
-                .good_quiet = good_quiet
-            }, move_count);
+            uint8_t to = __builtin_ctzll(moves);
+            moves = moves & (moves - 1);
+                
+            move_list[mc++] = create_move(from, to, NORMAL);
         }
-            
 
     }
+    *move_count = mc;
     
 }
 
@@ -669,10 +425,8 @@ void generate_king_boards(Game * game);
 
 void init_piece_boards(Game * game);
 void update_blocker_masks(Game * game);
-// void generate_non_quiet_moves(Game * game, Side side, Move move_list[200], int * move_count);
-// void generate_moves(Game * game, Side side, Move move_list[200], int * move_count);
 
-static inline void generate_non_quiet_moves(Game * game, Side side, Move move_list[200], int * move_count){
+static inline void generate_non_quiet_moves(Game * game, Side side, Move move_list[256], uint8_t * move_count, bool generate_checks){
     uint64_t blockers = game->board_pieces[BOTH];
 
     uint64_t potential_captures = 0;
@@ -682,319 +436,62 @@ static inline void generate_non_quiet_moves(Game * game, Side side, Move move_li
     
     potential_captures = game->board_pieces[other_side];
     own_pieces = game->board_pieces[side];
-    MovementMasks masks;
-    // generate_movement_masks(game, side, &masks);
     
-    generate_pawn_moves(game, move_list, move_count, side, potential_captures, own_pieces, &masks, true);
-    generate_knight_moves(game, move_list, move_count, side, potential_captures, own_pieces, &masks, true);
-    generate_bishop_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, &masks, true);
-    generate_rook_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, &masks, true);
-    generate_queen_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, &masks, true);
-    generate_king_moves(game, move_list, move_count, side, potential_captures, own_pieces, &masks, true);
+    generate_pawn_moves_new(game, move_list, move_count, side, potential_captures, own_pieces, true, generate_checks);
+    generate_knight_moves(game, move_list, move_count, side, potential_captures, own_pieces, true, generate_checks);
+    generate_bishop_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, true, generate_checks);
+    generate_rook_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, true, generate_checks);
+    generate_queen_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, true, generate_checks);
+    generate_king_moves(game, move_list, move_count, side, potential_captures, own_pieces, true);
 }
 
-static inline void generate_moves(Game * game, Side side, Move move_list[200], int * move_count){
+static inline void generate_moves(Game * game, Side side, Move move_list[256], uint8_t * move_count){
 
     uint64_t blockers = game->board_pieces[BOTH];
 
     uint64_t potential_captures = 0;
     uint64_t own_pieces = 0;
-    uint64_t our_attack_mask = 0;
-    uint64_t enemy_attack_mask = 0;
     Side other_side = (Side)!side;
-
-
     potential_captures = game->board_pieces[other_side];
     own_pieces = game->board_pieces[side];
 
-    // castling and attack mask generation
-    MovementMasks masks;
-    
-    // generate_movement_masks(game, side, &masks);
-
-    // attack_mask = generate_attack_mask(game, other_side);
-
-    if (game->castle_flags[side][QUEENSIDE]){
+    uint64_t e_am = 0, e_am_datk = 0;
+    if (game->st->castle_flags & (side ? CWQ : CBQ)){
         
         if (!(game->board_pieces[BOTH] & castle_occupation_masks[side][QUEENSIDE])){
 
-            if (
-            !is_square_attacked(game, (Side)!side, castle_attack_squares[side][QUEENSIDE][0])
-            &&
-            !is_square_attacked(game, (Side)!side, castle_attack_squares[side][QUEENSIDE][1])
-            &&
-            !is_square_attacked(game, (Side)!side, castle_attack_squares[side][QUEENSIDE][2])){
-        
-                push_move(move_list, (Move){
-                    .start_index = king_castle_locations[side][QUEENSIDE][START],
-                    .end_index = king_castle_locations[side][QUEENSIDE][END],
-                    .type = CASTLE,
-                    .side = side,
-                    .piece = KING,
-                    .castle_side = QUEENSIDE,
-                    .double_push = false,
-                    .loses_rights = true,
-                    .rights_toggle = BOTHSIDE,
-                    .is_checking = false,
-                    .good_quiet = false
-                }, move_count);
+            e_am = generate_attack_mask(game, (Side)!side, &e_am_datk);
+            
+            if ((e_am & castle_masks[side][QUEENSIDE]) == 0){
+                move_list[(*move_count)++] = create_move(king_castle_locations[side][QUEENSIDE][START], king_castle_locations[side][QUEENSIDE][END], CASTLE);
             }
         }
     }
 
-    if (game->castle_flags[side][KINGSIDE]){
+    if (game->st->castle_flags & (side ? CWK : CBK)){
         
         if (!(game->board_pieces[BOTH] & castle_occupation_masks[side][KINGSIDE])){
 
-            if (
-            !is_square_attacked(game, (Side)!side, castle_attack_squares[side][KINGSIDE][0])
-            &&
-            !is_square_attacked(game, (Side)!side, castle_attack_squares[side][KINGSIDE][1])
-            &&
-            !is_square_attacked(game, (Side)!side, castle_attack_squares[side][KINGSIDE][2])){
-        
-                push_move(move_list, (Move){
-                    .start_index = king_castle_locations[side][KINGSIDE][START],
-                    .end_index = king_castle_locations[side][KINGSIDE][END],
-                    .type = CASTLE,
-                    .side = side,
-                    .piece = KING,
-                    .castle_side = KINGSIDE,
-                    .loses_rights = true,
-                    .rights_toggle = BOTHSIDE,
-                    .is_checking = false,
-                    .good_quiet = false
-                }, move_count);
+            if (!e_am){
+                e_am = generate_attack_mask(game, (Side)!side, &e_am_datk);
+            }
+            
+            if ((e_am & castle_masks[side][KINGSIDE]) == 0){
+                move_list[(*move_count)++] = create_move(king_castle_locations[side][KINGSIDE][START], king_castle_locations[side][KINGSIDE][END], CASTLE);
             }
         }
     } 
     
     
-    generate_pawn_moves(game, move_list, move_count, side, potential_captures, own_pieces, &masks, false);
-    generate_knight_moves(game, move_list, move_count, side, potential_captures, own_pieces, &masks, false);
-    generate_bishop_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, &masks, false);
-    generate_rook_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, &masks, false);
-    generate_queen_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, &masks, false);
-    generate_king_moves(game, move_list, move_count, side, potential_captures, own_pieces, &masks, false);
+    generate_pawn_moves_new(game, move_list, move_count, side, potential_captures, own_pieces, false, true);
+    generate_knight_moves(game, move_list, move_count, side, potential_captures, own_pieces, false, true);
+    generate_bishop_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, false, true);
+    generate_rook_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, false, true);
+    generate_queen_moves(game, move_list, move_count, side, potential_captures, own_pieces, blockers, false, true);
+    generate_king_moves(game, move_list, move_count, side, potential_captures, own_pieces, false);
 
     
 
-}
-
-static inline void update_incremental_material_move(Game * game, Side side, PieceType p, int start, int end, bool capture, int capture_square, PieceType cp, bool undo, uint64_t our_pieces_before, uint64_t their_pieces_before){
-
-    uint64_t start_mask = 0;
-    uint64_t mas = 0;
-    uint64_t end_mask;
-    uint64_t mae = 0;
-    switch(p){
-        case PAWN:
-
-            start_mask = pawn_captures[side][start];
-            end_mask = pawn_captures[side][end];
-            mas = start_mask & game->board_pieces[!side];
-            mae = end_mask & game->board_pieces[!side];
-
-            break;
-        case KNIGHT:
-            
-            start_mask = knight_moves[start];
-            end_mask = knight_moves[end];
-            mas = start_mask & game->board_pieces[!side];
-            mae = end_mask & game->board_pieces[!side];
-
-            break;
-        case BISHOP:
-
-            start_mask = fetch_bishop_moves(game, start, our_pieces_before|their_pieces_before);
-            end_mask = fetch_bishop_moves(game, end, game->board_pieces[BOTH] );
-            mas = start_mask & game->board_pieces[!side];
-            mae = end_mask & game->board_pieces[!side];
-
-            
-            break;
-        case ROOK:
-            start_mask = fetch_rook_moves(game, start, our_pieces_before|their_pieces_before);
-            end_mask = fetch_rook_moves(game, end, game->board_pieces[BOTH] );
-            mas = start_mask & game->board_pieces[!side];
-            mae = end_mask & game->board_pieces[!side];
-            break;
-        case QUEEN:
-            start_mask = fetch_queen_moves(game, start, our_pieces_before|their_pieces_before);
-            end_mask = fetch_queen_moves(game, end, game->board_pieces[BOTH] );
-            mas = start_mask & game->board_pieces[!side];
-            mae = end_mask & game->board_pieces[!side];
-            break;
-        case KING:
-            start_mask = king_moves[start];
-            end_mask = king_moves[end];
-            mas = start_mask & game->board_pieces[!side];
-            mae = end_mask & game->board_pieces[!side];
-            break;
-    }
-
-
-
-    
-    int sc = bit_count(start_mask & ~our_pieces_before );
-    int ec = 0;
-    ec =bit_count(end_mask & ~(game->board_pieces[side]));
-    if (undo){
-        game->mobility_score_mg[side] += sc * MOBILITY_BONUS_MG[p];
-        game->mobility_score_eg[side] += sc * MOBILITY_BONUS_EG[p];
-        game->mobility_score_mg[side] -= ec * MOBILITY_BONUS_MG[p];
-        game->mobility_score_eg[side] -= ec * MOBILITY_BONUS_EG[p];
-
-        if (mas){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[!side], mas, side, &a);
-            game->valuable_attacker_score[side] += ATTACKING_HIGHER_VALUE_BONUS[p][a];
-        }
-        if (mae){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[!side], mae, side, &a);
-            game->valuable_attacker_score[side] -= ATTACKING_HIGHER_VALUE_BONUS[p][a];
-        }
-        
-    } else {
-        game->mobility_score_mg[side] -= sc * MOBILITY_BONUS_MG[p];
-        game->mobility_score_eg[side] -= sc * MOBILITY_BONUS_EG[p];
-        game->mobility_score_mg[side] += ec * MOBILITY_BONUS_MG[p];
-        game->mobility_score_eg[side] += ec * MOBILITY_BONUS_EG[p];
-    
-        if (mas){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[!side], mas, side, &a);
-            game->valuable_attacker_score[side] -= ATTACKING_HIGHER_VALUE_BONUS[p][a];
-        }
-        if (mae){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[!side], mae, side, &a);
-            game->valuable_attacker_score[side] += ATTACKING_HIGHER_VALUE_BONUS[p][a];
-        }
-        
-    }
-
-
-
-    if (!capture) return;
-    
-    uint64_t cmask = 0;
-    uint64_t cma = 0;
-    switch (cp){
-        case PAWN:
-
-            cmask = pawn_captures[!side][capture_square];
-            cma = cmask & game->board_pieces[side];
-
-            break;
-        case KNIGHT:
-            
-            cmask = knight_moves[capture_square];
-            cma = cmask & game->board_pieces[side];
-
-            break;
-        case BISHOP:
-
-            cmask = fetch_bishop_moves(game, capture_square, our_pieces_before |their_pieces_before);
-            cma = cmask & game->board_pieces[side];
-            break;
-        case ROOK:
-            cmask = fetch_rook_moves(game, capture_square, our_pieces_before |their_pieces_before);
-            cma = cmask & game->board_pieces[side];
-            break;
-        case QUEEN:
-            cmask = fetch_queen_moves(game, capture_square, our_pieces_before |their_pieces_before);
-            cma = cmask & game->board_pieces[side];
-            break;
-        case KING:
-            cmask = king_moves[capture_square];
-            cma = cmask & game->board_pieces[side];
-            break;
-        
-    }
-
-    int cc = bit_count(cmask & ~their_pieces_before);
-    if (undo){
-        game->mobility_score_mg[!side] += cc * MOBILITY_BONUS_MG[cp];
-        game->mobility_score_eg[!side] += cc * MOBILITY_BONUS_EG[cp];
-
-        if (cma){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[side], cma, side, &a);
-            game->valuable_attacker_score[!side] += ATTACKING_HIGHER_VALUE_BONUS[cp][a];
-        }
-        
-    } else {
-        game->mobility_score_mg[!side] -= cc * MOBILITY_BONUS_MG[cp];
-        game->mobility_score_eg[!side] -= cc * MOBILITY_BONUS_EG[cp];
-    
-        if (cma){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[side], cma, side, &a);
-            game->valuable_attacker_score[!side] -= ATTACKING_HIGHER_VALUE_BONUS[cp][a];
-        }
-        
-    }
-}
-
-
-static inline void update_incremental_promotion(Game * game, Side side, PieceType pp, int sq, bool undo, uint64_t our_pieces, uint64_t their_pieces){
-
-    uint64_t cmask = 0;
-    uint64_t cma = 0;
-    switch (pp){
-        case PAWN:
-
-            cmask = pawn_captures[side][sq];
-            cma = cmask & game->board_pieces[!side];
-
-            break;
-        case KNIGHT:
-            
-            cmask = knight_moves[sq];
-            cma = cmask & game->board_pieces[!side];
-
-            break;
-        case BISHOP:
-
-            cmask = fetch_bishop_moves(game, sq, game->board_pieces[BOTH]);
-            cma = cmask & game->board_pieces[!side];
-            break;
-        case ROOK:
-            cmask = fetch_rook_moves(game, sq, game->board_pieces[BOTH]);
-            cma = cmask & game->board_pieces[!side];
-            break;
-        case QUEEN:
-            cmask = fetch_queen_moves(game, sq, game->board_pieces[BOTH]);
-            cma = cmask & game->board_pieces[!side];
-            break;
-        case KING:
-            cmask = king_moves[sq];
-            cma = cmask & game->board_pieces[!side];
-            break;
-        
-    }
-    int cc = bit_count(cmask & ~game->board_pieces[side]);
-    if (undo){
-        game->mobility_score_mg[side] -= cc * MOBILITY_BONUS_MG[pp];
-        game->mobility_score_eg[side] -= cc * MOBILITY_BONUS_EG[pp];
-        
-        if (cma){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[!side], cma, side, &a);
-            game->valuable_attacker_score[side] -= ATTACKING_HIGHER_VALUE_BONUS[pp][a];
-        }
-    } else {
-        game->mobility_score_mg[side] += cc * MOBILITY_BONUS_MG[pp];
-        game->mobility_score_eg[side] += cc * MOBILITY_BONUS_EG[pp];
-        if (cma){
-            PieceType a;
-            mva_from_attacker_mask(game, game->pieces[!side], cma, side, &a);
-            game->valuable_attacker_score[side] += ATTACKING_HIGHER_VALUE_BONUS[pp][a];
-        }
-        
-    }
 }
 
 #endif

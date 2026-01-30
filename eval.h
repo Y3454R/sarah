@@ -7,26 +7,45 @@
 #include "magic.h"
 #include "game.h"
 #include "move_generation.h"
+#include "eval_constants.h"
 
 /* 
     @brief used to initialize evaluation and phase values when we set the board to a new fen. used to be way more useful, since our material is no longer incremental due to computation demands.
 */
 void init_evaluate(Game * game);
 
-/* @brief static exchange evaluation. this controls the moves we let into our qsearch and helps in overall move ordering, by pushing obviously bad captures down. */
 
-// int see(Game *game, Move * move);
+/* @brief this see was transformed from my own implementation to now be closer to stockfish's with early threshold outs. really though, it isn't much of an elo increase in my engine and sacrifices a bit of accuracy. i may end up using both versions later */
 
-static inline int see(Game *game, Move * move) {
-    int sq = move->end_index;
-    int from = move->start_index;
-    PieceType capture_piece = move->capture_piece;
+static inline bool see(Game *game, Move move, int16_t threshold) {
 
-    int gain[32];
-    int depth = 0;
+    // from SF: they propose that other moves such as en passants and promos pass for speed
+    if (move_type(move) != NORMAL) return 0 >= threshold;
 
-    int side = game->side_to_move;
+    uint8_t to = move_to(move);
+    uint8_t from = move_from(move);
+    bool cap = is_cap(game, move);
 
+    PieceType piece = move_piece(game, move);
+    PieceType capture_piece = move_cp(game, move);
+
+    Side original_side = game->side_to_move;
+    int side = original_side;
+
+    int16_t val = 0;
+    int16_t last_cap = 0;
+
+    val += PVAL[capture_piece] - threshold;
+
+
+    // if our val is somehow less than 0 (very rare), then even if we aren't captured we're still below the threshold
+    if (val < 0) return false;
+
+    val -= PVAL[piece];
+
+    // if our val is greater than zero even after assuming we get captured, then we can early out as positive
+    if (val >= 0) return true;
+    
     uint64_t occ = game->board_pieces[BOTH]; 
     uint64_t temp_pieces[COLOR_MAX][PIECE_TYPES];
 
@@ -34,98 +53,124 @@ static inline int see(Game *game, Move * move) {
         temp_pieces[BLACK][i] = game->pieces[BLACK][i];
         temp_pieces[WHITE][i] = game->pieces[WHITE][i];
     }
-    
-    gain[depth] = piece_values_mg[capture_piece];
+    if (cap){
+        occ ^= bits[to];
+        temp_pieces[!side][capture_piece] ^= (bits[to]);  
+    }
 
-    occ ^= (1ULL << sq);
-    temp_pieces[!side][capture_piece] ^= (1ULL << sq);  
+    last_cap = val;
+
+    occ ^= bits[from];
+    temp_pieces[side][piece] ^= bits[from];  
     
     uint64_t attackers[2];
-    attackers[WHITE] = attacker_mask_for_square(game, WHITE, temp_pieces[WHITE], move->end_index, occ);
-    attackers[BLACK] = attacker_mask_for_square(game, BLACK, temp_pieces[BLACK], move->end_index, occ);
+    attackers[WHITE] = attacker_mask_for_square(game, WHITE, temp_pieces[WHITE], to, occ);
+    attackers[BLACK] = attacker_mask_for_square(game, BLACK, temp_pieces[BLACK], to, occ);
 
     side = !side; 
+    int c = 0;
 
     while (true) {
         uint64_t att = attackers[side];
-        if (!att || depth > 30) break;
+
+        // get rid of pinned pieces
+        if (game->st->pinners[!side] & occ) att &= ~game->st->ci.blockers_for_king[side];
         
-        PieceType lva = (PieceType)0;
+        // exit out if no attackers left
+        if (!att || c > 30) break;
+        
+        
+        PieceType lva = PAWN;
         int next_from = lva_from_attacker_mask(temp_pieces[side], att, &lva); 
-        if (next_from == -1){
-            printf("COULD NOT FIND ATTACKER. MASKS UNSYNCED. ERROR.\n");
+        assert(next_from != -1);
+        val = -val - 1 - PVAL[lva]; 
+
+        // we have to swap side preemptively here just in case we need to swap back
+        side = !side;
+
+        // if our value becomes positive, due to negamax we can early out. I believe this is why there is a - 1 headroom on the val iteration.
+        if (val >= 0){
+
+            // this swaps back to represent the fact that we would be able to capture the king that just captured since the other side still has attackers
+            if (lva == KING && attackers[side]) side = !side;
             break;
-        }
-        if (next_from < 0 || next_from >= 64) {
-            printf("BAD LVA from returned %d\n", next_from); abort();
+
         }
 
-        depth++;
-        gain[depth] = piece_values_mg[lva] - gain[depth-1];
+        occ ^= (bits[next_from]);
+        temp_pieces[!side][lva] ^= (bits[next_from]);
+        attackers[!side] ^= (bits[next_from]);
 
-        occ ^= (1ULL << next_from);
-        temp_pieces[side][lva] ^= (1ULL << next_from);
-        attackers[side] ^= (1ULL << next_from);
-
-        uint64_t discovered_bishops = fetch_bishop_moves(game, sq, occ) & (temp_pieces[side][BISHOP] | temp_pieces[side][QUEEN]);
-        uint64_t discovered_rooks = fetch_rook_moves(game, sq, occ) & (temp_pieces[side][ROOK] | temp_pieces[side][QUEEN]);
+        uint64_t discovered_bishops = fetch_bishop_moves(to, occ) & (temp_pieces[side][BISHOP] | temp_pieces[side][QUEEN]);
+        uint64_t discovered_rooks = fetch_rook_moves(to, occ) & (temp_pieces[side][ROOK] | temp_pieces[side][QUEEN]);
         attackers[side] |= discovered_bishops | discovered_rooks;
         
-        uint64_t discovered_opp_bishops = fetch_bishop_moves(game, sq, occ) & (temp_pieces[!side][BISHOP] | temp_pieces[!side][QUEEN]);
+        uint64_t discovered_opp_bishops = fetch_bishop_moves(to, occ) & (temp_pieces[!side][BISHOP] | temp_pieces[!side][QUEEN]);
         
-        uint64_t discovered_opp_rooks = fetch_rook_moves(game, sq, occ) & (temp_pieces[!side][ROOK] | temp_pieces[!side][QUEEN]);
+        uint64_t discovered_opp_rooks = fetch_rook_moves(to, occ) & (temp_pieces[!side][ROOK] | temp_pieces[!side][QUEEN]);
         attackers[!side] |= discovered_opp_bishops | discovered_opp_rooks;
+        c++;
 
-        side = !side;
     }
 
-    for (int i = depth - 1; i >= 0; i--) 
-        gain[i] = -MAX(-gain[i], gain[i+1]);
-
-    return gain[0];
+    // if the side isn't our original side, we win since they have no attackers. if it is our original side, we ran out of attackers.
+    return original_side != side;
 }
 
+
+
 /* 
-  @brief does what you would expect, constants found in utils.
+  @brief the pawn evaluation! used to be a lot more complicated, with bonuses for space, but now is very simple. we accumulate masks for passers and pawn attacks, and store them within the pawn hash table
 */
 
-static inline uint64_t evaluate_pawn_structure(Game * game, Side side, int * mg, int * eg){
-    int score_mg = 0, score_eg = 0;
+static inline Score evaluate_pawn_structure(Game * game, Side side, EvalMasks * masks){
 
-    // pawns
+    Score s = 0;
 
     uint64_t pawns = game->pieces[side][PAWN];
     uint64_t friendly_pawns = game->pieces[side][PAWN];
     uint64_t enemy_pawns = game->pieces[!side][PAWN];
     for (int i = 0; i < 8; i++){
-        int count = __builtin_popcountll(pawns & file_masks[i]);
-        // doubled pawn
-        if (count > 1) score_mg += (count - 1) * DOUBLED_PAWN_PENALTY_MG;
-        if (count > 1) score_eg += (count - 1) * DOUBLED_PAWN_PENALTY_EG;
+        // doubled pawns
+        uint8_t count = __builtin_popcountll(pawns & file_masks[i]);
+        if (count > 1) s += (count - 1) * P_DOUBLED;
     }
-    
 
-    uint64_t attacks = 0;
+    // cache pawn attacks
+    uint64_t ra = !side ? (pawns << 7 & ~file_masks[7]) : pawns >> 9 & ~file_masks[7];
+    uint64_t la = !side ? (pawns << 9 & ~file_masks[0]) : pawns >> 7 & ~file_masks[0];
+    uint64_t attacks = ra | la;
+    masks->am_p[side][PAWN] = attacks;
+
+    // TODO pawn penalty for being attacked by pawns on the sides. to represent how easy it is to defend
+
     while (pawns){
-        int pos = pop_lsb(&pawns);
-        attacks |= pawn_captures[side][pos];
-        
-        int file = pos % 8;
+        uint8_t pos = __builtin_ctzll(pawns);
+        pawns = pawns & (pawns - 1);
+
+        uint8_t file = SQ_TO_FILE[pos];
+        uint8_t rank = side ? SQ_TO_RANK[pos] : SQ_TO_RANK[flip_square(pos)];
         bool enemy_pawn_on_file = enemy_pawns & in_front_file_masks[side][pos];
         bool enemy_pawn_in_front_adjacent = enemy_pawns & adjacent_in_front_masks[side][pos];
+        bool is_passer = false;
+
+        // passers
+        // there was an idea here to evaluate isolated passers separately since they are commonly better than just isolated pawns, but it never worked in testing
+        if (!(game->pieces[!side][PAWN] & passed_pawn_masks[side][pos]) && !enemy_pawn_on_file) {
+            
+            s += eval_params[ep_idx.passed_pawn[rank]];
+            masks->passers[side] |= bits[pos];
+            is_passer = true;
+
+        }
+
         // isolated
         if(!(game->pieces[side][PAWN] & adjacent_file_masks[file])) {
-            score_mg += ISOLATED_PAWN_PENALTY_MG;
-            score_eg += ISOLATED_PAWN_PENALTY_EG;
-        }
-        // passers
-        if (!(game->pieces[!side][PAWN] & passed_pawn_masks[side][pos]) && !enemy_pawn_on_file) {
-            score_mg += PASSED_PAWN_BONUS_MG;
-            score_eg += PASSED_PAWN_BONUS_EG;
+                s += eval_params[ep_idx.isolated_pawn[rank]];
         }
 
         // backward pawn
-        bool has_supporting_adjacent = (friendly_pawns & (adjacent_file_masks[file] & in_front_ranks_masks[side][pos])) != 0;
+        bool has_supporting_adjacent = (friendly_pawns & (adjacent_file_masks[file] & in_front_ranks_masks[side][pos]));
 
 
         // check if a forward square is is controlled by an attacking enemy pawn
@@ -137,654 +182,743 @@ static inline uint64_t evaluate_pawn_structure(Game * game, Side side, int * mg,
             enemy_controls_front = pawn_captures[side][forward_sq] & enemy_pawns;
         }
 
-        // is backward
-        if (!has_supporting_adjacent && (enemy_controls_front || game->piece_at[forward_sq] == PAWN)){
-            score_mg += BACKWARD_PAWN_PENALTY_MG;
-            score_eg += BACKWARD_PAWN_PENALTY_EG;
+        if (!has_supporting_adjacent && (enemy_controls_front || (bits[forward_sq] & game->pieces[!side][PAWN]))){
+            s += eval_params[ep_idx.backward_pawn[rank]];
         }
 
         // candidate passer
-
-        if (!enemy_pawn_on_file && !enemy_pawn_in_front_adjacent){
-            score_mg += CANDIDATE_PASSER_BONUS_MG;
-            score_eg += CANDIDATE_PASSER_BONUS_EG;
+        if (!enemy_pawn_on_file && !enemy_pawn_in_front_adjacent && !is_passer){
+            s += eval_params[ep_idx.candidate_passer[rank]];
         }
 
         // chained pawn
         if (friendly_pawns & pawn_captures[side][pos]){
-            
-            score_mg += CHAINED_PAWN_BONUS_MG;
-            score_eg += CHAINED_PAWN_BONUS_EG;
+            s += eval_params[ep_idx.chained_pawn];
         }
 
+    }
+    return s;
+}
+
+
+static inline void generate_attack_mask_and_eval_mobility(Game * game, Side side, EvalMasks * masks, uint64_t piece_attacks[COLOR_MAX][PIECE_TYPES][PIECE_MAX]){
+    
+    uint64_t attacked_squares = 0;
+    uint64_t datk = 0;
+
+    // pawns calced and cached in hash
+    masks->am_nk[side] |= masks->am_p[side][PAWN];
+    attacked_squares |= masks->am_p[side][PAWN];
+
+    uint64_t occ = game->board_pieces[BOTH];
         
-        int kfile = game->pieces[!side][KING] % 8;
-    }
-    return attacks;
-}
-
-/* 
-  @brief gets the space between both pawn lines and gives a bonus based on files that are closest to the middle 
-  the goal with this function was to incentivize fighting for the center, especially when playing black, because I noticed a tendency to get caught in a blocked off position if we don't find early initiative. now with an opening book it doesn't *really* matter but I think it's still cool
-*/
-
-static inline int evaluate_pawn_space(Game * game, int * white, int  * black){
     
-    uint64_t enemy_pawns = game->pieces[BLACK][PAWN];
-    uint64_t friendly_pawns = game->pieces[WHITE][PAWN];
-    int ws = 0, bs = 0;
-    int sum_cnt_white = 0;
-    int sum_cnt_black = 0;
-    for (int f = 0; f < 8; f++){
-        int fr = 0;
-        int er = 0;
+    // iterate over the piece list and push moves to respective piece masks
+    for (int p = KNIGHT; p < KING; p++){
+        uint8_t * pl = game->piece_list[side][p];
+        uint8_t idx = 0;
+        for (uint8_t pos = *pl; pos != SQ_NONE; pos = *++pl){
 
-        uint64_t fp = (friendly_pawns & file_masks[f]);
-        if (fp){
-            int pos = bit_scan_forward(&fp);
-            fr = abs(7-(pos/8));
-            ws += (fr - 2) * PAWN_SPACE_FILE_WEIGHTS[f];
-            sum_cnt_white++;
-        }
-        uint64_t ep = (enemy_pawns & file_masks[f]);
-        if (ep){
-            // find lowest
-            int pos = bit_scan_backward(&ep);
-            // invert to compare
-            er = pos/8;
-            bs += (er - 2) * PAWN_SPACE_FILE_WEIGHTS[f];
-            sum_cnt_black++;
-        }
-    }
+            uint64_t moves = moves_at(side, pos, (PieceType)p, occ);
+            // square was already attacked -> double attack
+            datk |= attacked_squares & moves;
 
-    *white = (int )ws / 8*4;
-    *black = (int )bs / 8*4;
-    return ws - bs;
-}
+            // attack mask for side
+            attacked_squares |= moves;
 
+            // attack mask (piece type)
+            masks->am_p[side][p] |= moves;
 
-/* @brief connected rooks and open file bonus eval */
+            // attack mask (no king)                
+            masks->am_nk[side] |= moves;
 
-static inline void evaluate_rook_files(Game * game, int side, int  * mg, int  * eg) {
+            // push masks onto per piece masks
+            piece_attacks[side][p][idx] = moves;
 
-    uint64_t pawns = game->pieces[side][PAWN];
-    uint64_t enemy_pawns = game->pieces[!side][PAWN];
-    uint64_t rooks = game->pieces[side][ROOK];
-
-    
-    while (rooks) {
-        int sq = pop_lsb(&rooks);
-        int file = sq % 8;
-        int rank = sq / 8;
-
-        bool mine = pawns & file_masks[file];
-        bool theirs = enemy_pawns & file_masks[file];
-
-        if (!mine) {
-            if (!theirs) {
-                *mg += ROOK_OPEN_FILE_BONUS;
-                *eg += ROOK_OPEN_FILE_BONUS;
-            } else {
-                *mg += ROOK_SEMI_OPEN_FILE_BONUS;
-                *eg += ROOK_SEMI_OPEN_FILE_BONUS;
+            // used to determine queen attack batteries. if a queen moves to a square, we need to know if it is defended, but we can only know that if we remove the queen and check behind it.
+            if (p == BISHOP || p == ROOK){
+                uint64_t xr = moves_at(side, pos, (PieceType)p, occ ^ game->pieces[side][QUEEN]);
+                masks->am_xr_nq[side] |= xr;
             }
-        }
-        bool connected_rooks = fetch_rook_moves(game, sq, game->board_pieces[BOTH]) & game->pieces[side][ROOK];
-        if (connected_rooks){
-            *mg += CONNECTED_ROOK_BONUS;
-            *eg += CONNECTED_ROOK_BONUS;
-            
+            idx++;
+    
         }
     }
-}
 
-/* @brief just a function that gives a bonus for late game king activity. this is supposed to just be handled by psqt, but I like to keep the king near to promoting pawns, especially stopping enemy promotions, with our lack of endgame tables */
-
-static inline int evaluate_endgame_king(Game * game, Side side){
+    // king moves
+    uint64_t moves = king_moves[game->st->k_sq[side]];
+    datk |= attacked_squares & moves;
+    attacked_squares |= moves;
+    masks->am_p[side][KING] |= moves;
+    piece_attacks[side][KING][game->piece_index[game->st->k_sq[side]]] = moves;
+    masks->am[side] = attacked_squares;
+    masks->datk[side] = datk;
     
-    const int MAX_MANHATTAN_DIST = 14;
-    const int MAX_CENTER_MANHATTAN_DIST = 6;
+    // attack mask (minors)
+    masks->am_m[side] = masks->am_p[side][BISHOP] | masks->am_p[side][KNIGHT];
+
+    // threat deficit penalty (squares we attack less)
+    masks->tdp[side] = (masks->am[!side] & ~masks->am[side]) | (masks->datk[!side] & ~masks->datk[side]);
+
+    // smaller tdp
+    masks->safe[side] = ~masks->am[!side] | masks->am[side];
+
+    // pawn pushes (with occupancy)
+    uint64_t pp = pawn_pushes(side, game->pieces[side][PAWN], game->board_pieces[BOTH]);
+
+    // safe pawn push attacks
+    masks->sppa[side] = pawn_attacks(side, pp & masks->safe[side]);
     
-    // get closest pawns to promotion and give a bonus for distance to it
-    // TODO make the curve exponential and not linear
-    int score = 0;
-    int king_pos = __builtin_ctzll(game->pieces[side][KING]);
-    int enemy_king_pos = __builtin_ctzll(game->pieces[!side][KING]);
-    uint64_t pawns = game->pieces[side][PAWN];
-    while (pawns){
-        int pos = pop_lsb(&pawns);
-        int pawn_val = PAWN_STORM_PSQT_EG[side][pos];
+    // weak squares (used for outposts later)
+    masks->wsq[!side] = masks->am_p[side][PAWN] & ~masks->am_p[!side][PAWN];
 
-        // not close enough to promotion to be considered
-        if (pawn_val < 4) continue;
-        int dist = manhattan_distance[pos][king_pos];
-        score += ((MAX_MANHATTAN_DIST - dist) * pawn_val) / 3;
-        int enemy_dist = manhattan_distance[pos][enemy_king_pos];
-        score -= ((MAX_MANHATTAN_DIST - enemy_dist) * pawn_val) / 3;
-    }
-    int dist_to_center = center_manhattan_distance[king_pos];
-    score += DIST_TO_CENTER_BONUS * (MAX_CENTER_MANHATTAN_DIST - dist_to_center);
-
-    return score;
 }
 
 
-static inline int evaluate_early_game_development(Game * game, Side side){
+/* king threat is evaluated as positive for the aggressor's side, so side is the attacking side and !side is the defending side. */
 
-    int eval = 0;
-    for (int i = KNIGHT; i < KING; i++){
-        if (STARTING_SQUARES[side][i] & game->pieces[side][i]){
-            eval += STARTING_SQUARE_VALUES[i];
-        }
-    }
-    return eval;
+
+static inline Score evaluate_king_threat(Game * game, Side side, EvalMasks * masks, uint64_t piece_attacks[COLOR_MAX][PIECE_TYPES][PIECE_MAX]){
+
+    Score s = 0;
+
+    // init values
+    uint8_t enemy_king_sq = game->st->k_sq[!side];
+    uint64_t ek = game->pieces[!side][KING];
+    uint64_t enemy_king_zone = king_zone_masks[!side][enemy_king_sq];
+
+
+    // make masks for each checking mask (TODO: just use the state->checkinfo for this)
+    uint64_t checks[PIECE_TYPES];
+    checks[PAWN] = pawn_captures[!side][enemy_king_sq];
+    checks[KNIGHT] = knight_moves[enemy_king_sq];
+    uint64_t bm = fetch_bishop_moves(enemy_king_sq, game->board_pieces[BOTH]);
+    uint64_t rm = fetch_rook_moves(enemy_king_sq, game->board_pieces[BOTH]);
+    checks[BISHOP] = bm;
+    checks[ROOK] = rm;
+    checks[QUEEN] = bm | rm;
+    checks[KING] = 0;
+    bool is_stm = side == game->side_to_move;
+
+    uint64_t weak_sq = masks->am[side] & ~masks->datk[!side] & (~masks->am[!side] | masks->am_p[!side][QUEEN] | masks->am_p[!side][KING]);
+    uint64_t safe = masks->tdp[!side];
+
+    uint64_t safe_attacks = weak_sq & enemy_king_zone;
+    uint8_t sa = __builtin_popcountll(safe_attacks);
+    uint64_t double_safe = masks->datk[side] & weak_sq & enemy_king_zone;
+    uint8_t dsafe = __builtin_popcountll(double_safe);
+    sa -= dsafe;
+
+    // double and safe king attacks to the king zone, since most of the rest only deals with the exact squares around the king. this provides enough to decide our presence next to the king
+    s += eval_params[ep_idx.ks_safe_king_attacks[MIN(sa, 15)]];
+    s += eval_params[ep_idx.ks_double_safe_king_attacks[MIN(__builtin_popcountll(double_safe), 15)]];
     
-}
-
-
-
-/* 
-  @brief evaluates pins to a side's queen and king
-  @return a score 
-*/
-static inline int  evaluate_pins(Game * game, Side side){
-
-    int ksq = 0;
-    int qsq = 0;
-    uint64_t queens = game->pieces[side][QUEEN];
-    uint64_t pins = 0;
-    while (queens){
-        int pos = pop_lsb(&queens);
-        pins |= piece_is_pinned(game, side, pos);
-    }
-    ksq = bit_scan_forward(&game->pieces[side][KING]);
-    pins |= piece_is_pinned(game, side, ksq);
-    int  pin_score = 0.0f;
-    pin_score += PIN_PENALTY * bit_count(pins);
-    return pin_score;
-}
-
-/* 
-    @brief material and mobility eval, also to avoid unnecessary looping, we compute additional things such as tempo attacks based on piece values, and batteries and bishop pair etc.
-    @param enemy_pawn_attacks attack mask from the pawn hash that helps us compute a penalty for pawns that restrict our mobility
-    @return an attack mask used for later tempo eval 
-*/
-// uint64_t evaluate_material_weighted(Game * game, Side side, int  * out_mg, int  * out_eg, uint64_t enemy_pawn_attacks);
-
-static inline uint64_t evaluate_material_weighted(Game * game, Side side, int  * out_mg, int  * out_eg, uint64_t enemy_pawn_attacks){
-    
-    const int MAX_MANHATTAN_DIST = 14;
-    uint64_t both = game->board_pieces[BOTH];
-    uint64_t our_pieces = game->board_pieces[side];
-    uint64_t other_pieces = game->board_pieces[!side];
-    int  mg = 0, eg = 0;
-    uint64_t pawns = game->pieces[side][PAWN];
-    int pawn_count = bit_count(pawns);
-    uint64_t attack_mask = 0;
-
-    int psqt_sign = 1;
-
-    
-    // this is here because of the texel tuning convention that our psqts end up negative for black. we still evaluate positive = white, but for simplicity's sake, we only subtract *after* this function returns
-    if (side == BLACK) psqt_sign = -1;
-
-    int moves_blocked_by_enemy_pawns = 0;
-    int enemy_king_sq = bit_scan_forward(&game->pieces[!side][KING]);
-
-
-    uint64_t enemy_king_zone = king_zone_masks[enemy_king_sq];
-    int  king_threat_level = 0;
-    
-    
-    while (pawns){
-        int pos = pop_lsb(&pawns);
-        uint64_t moves = pawn_moves[side][pos] & ~our_pieces;
-        mg += PSQT_MG[side][PAWN][pos];
-        eg += PSQT_EG[side][PAWN][pos];
-        uint64_t atk = moves & other_pieces;
-        
-        if (atk){
-            // int attack_pos = pop_lsb(&atk);
-            PieceType p;
-            mva_from_attacker_mask(game, game->pieces[!side], atk, side, &p);
-            mg += ATTACKING_HIGHER_VALUE_BONUS[PAWN][p];
-            eg += ATTACKING_HIGHER_VALUE_BONUS[PAWN][p];
-        }
-
-        attack_mask |= pawn_captures[side][pos];
-    }
-    uint64_t knights = game->pieces[side][KNIGHT];
-    int knight_count = bit_count(knights);
-    while (knights){
-        int pos = pop_lsb(&knights);
-        uint64_t moves = knight_moves[pos] & ~our_pieces;
-        int count = __builtin_popcountll(moves);
-        mg += PSQT_MG[side][KNIGHT][pos];
-        eg += PSQT_EG[side][KNIGHT][pos];
-        mg += count * MOBILITY_BONUS_MG[KNIGHT];
-        eg += count * MOBILITY_BONUS_EG[KNIGHT];
-        attack_mask |= knight_moves[pos];
-        uint64_t attack = knight_moves[pos] & other_pieces;
-        if(attack){
-            PieceType p;
-            mva_from_attacker_mask(game, game->pieces[!side], attack, side, &p);
-            mg += ATTACKING_HIGHER_VALUE_BONUS[KNIGHT][p];
-            eg += ATTACKING_HIGHER_VALUE_BONUS[KNIGHT][p];
-        }
-    }
-    uint64_t bishops = game->pieces[side][BISHOP];
-    int bishop_count = 0;
-    while (bishops){
-        int pos = pop_lsb(&bishops);
-        bishop_count++;
-        uint64_t raw_moves = fetch_bishop_moves(game, pos, both);
-        uint64_t moves = raw_moves & ~our_pieces;
-        int count = bit_count(moves);
-        mg += PSQT_MG[side][BISHOP][pos];
-        eg += PSQT_EG[side][BISHOP][pos];
-        mg += count * MOBILITY_BONUS_MG[BISHOP];
-        eg += count * MOBILITY_BONUS_EG[BISHOP];
-        attack_mask |= raw_moves;
-        uint64_t attack = raw_moves & other_pieces;
-        if(attack){
-            PieceType p;
-            mva_from_attacker_mask(game, game->pieces[!side], attack, side, &p);
-            mg += ATTACKING_HIGHER_VALUE_BONUS[BISHOP][p];
-            eg += ATTACKING_HIGHER_VALUE_BONUS[BISHOP][p];
-        }
-    }
-    if  (bishop_count >= 2){
-        mg += BISHOP_PAIR_BONUS;
-        eg += BISHOP_PAIR_BONUS;
-    }
-    uint64_t rooks = game->pieces[side][ROOK];
-    int rook_count = bit_count(rooks);
-    while (rooks){
-        int pos = pop_lsb(&rooks);
-        uint64_t raw_moves = fetch_rook_moves(game, pos, both);
-        uint64_t moves = raw_moves & ~our_pieces;
-        int count = bit_count(moves);
-        mg += PSQT_MG[side][ROOK][pos];
-        eg += PSQT_EG[side][ROOK][pos];
-        mg += count * MOBILITY_BONUS_MG[ROOK];
-        eg += count * MOBILITY_BONUS_EG[ROOK];
-        attack_mask |= raw_moves;
-        // we are attacking
-        uint64_t attack = raw_moves & other_pieces;
-        if(attack){
-            PieceType p;
-            mva_from_attacker_mask(game, game->pieces[!side], attack, side, &p);
-            mg += ATTACKING_HIGHER_VALUE_BONUS[ROOK][p];
-            eg += ATTACKING_HIGHER_VALUE_BONUS[ROOK][p];
-        }
-    }
-    uint64_t queens = game->pieces[side][QUEEN];
-    int queen_count = bit_count(queens);
-    while (queens){
-        int pos = pop_lsb(&queens);
-        uint64_t rook_moves = fetch_rook_moves(game, pos, both);
-        uint64_t bishop_moves =  fetch_bishop_moves(game, pos, both);
-        uint64_t raw_moves = rook_moves | bishop_moves;
-        uint64_t moves = raw_moves & ~our_pieces;
-        int count = bit_count(moves);
-        // int swap_pos = pos;
-        mg += PSQT_MG[side][QUEEN][pos];
-        eg += PSQT_EG[side][QUEEN][pos];
-        mg += count * MOBILITY_BONUS_MG[QUEEN];
-        eg += count * MOBILITY_BONUS_EG[QUEEN];
-        attack_mask |= raw_moves;
-        if (rook_moves & game->pieces[side][ROOK]){
-            if (rook_moves & king_zone_masks[enemy_king_sq]){
-                mg += KING_ZONE_BATTERY_BONUS;
-                eg += KING_ZONE_BATTERY_BONUS;
-            }
-            
-            mg += QUEEN_ROOK_CONNECTED_BONUS;
-            eg += QUEEN_ROOK_CONNECTED_BONUS;
-        }
-        if (bishop_moves & game->pieces[side][BISHOP]){
-            if (bishop_moves & king_zone_masks[enemy_king_sq]){
-                mg += KING_ZONE_BATTERY_BONUS;
-                eg += KING_ZONE_BATTERY_BONUS;
-            }
-            mg += QUEEN_BISHOP_CONNECTED_BONUS;
-            eg += QUEEN_BISHOP_CONNECTED_BONUS;
-        }
-        // we are attacking
-        uint64_t attack = raw_moves & other_pieces;
-        if(attack){
-            PieceType p;
-            mva_from_attacker_mask(game, game->pieces[!side], attack, side, &p);
-            mg += ATTACKING_HIGHER_VALUE_BONUS[QUEEN][p];
-            eg += ATTACKING_HIGHER_VALUE_BONUS[QUEEN][p];
-        }
-    }
-        
-    int kpos = bit_scan_forward(&game->pieces[side][KING]);
-    int swap_wkpos = kpos;
-    // uint64_t king_moves = king_moves[kpos];
-    mg += PSQT_MG[side][KING][kpos];
-    eg += PSQT_EG[side][KING][kpos];
-    attack_mask |= king_moves[kpos];
-    
-
-    
-    *(out_mg) += mg;
-    *(out_eg) += eg;
-    return attack_mask;
-}
-
-
-/* @brief evaluates open files and diagonals near the king, and checks for attackers on them. it used to be much more verbose, which is why that n exists as a diagonal
-TODO check forward diagonals in king push direction, not just + 8 */
-
- // void evaluate_king_pawn_safety(Game * game, Side side, int  * out_mg, int  * out_eg);
-static inline void evaluate_king_pawn_safety(Game * game, Side side, int  * out_mg, int  * out_eg){
-    
-    int king_sq = bit_scan_forward(&game->pieces[side][KING]);
-    uint64_t our_pawns = game->pieces[side][PAWN];
-    uint64_t their_pawns = game->pieces[!side][PAWN];
-    uint64_t pawn_shield =  game->pieces[side][PAWN] & pawn_shield_masks[side][king_sq];    
-    int  mg = 0, eg = 0;
-    int sign = 1;
-    if (side == BLACK) sign = -1;
-    int shield = bit_count(pawn_shield);
-    int open_file_penalties = 0;
-
-    int file = king_sq % 8;
-    if (file >= 1){
-        bool semi_open = !(our_pawns & file_masks[file - 1]);
-        if (semi_open){
-            if (!(their_pawns & file_masks[file - 1])){
-                if ((file_masks[file - 1] & game->pieces[!side][ROOK]) || file_masks[file - 1] & game->pieces[!side][QUEEN]){
-                    mg += OPEN_FILE_NEAR_KING_WITH_ATTACKER;
-                    eg += OPEN_FILE_NEAR_KING_WITH_ATTACKER;
-                    
-                } else {
-                    mg += OPEN_FILE_NEAR_KING_PENALTY;
-                    eg += OPEN_FILE_NEAR_KING_PENALTY;
-                    
-                }
-            } else {
-                mg += SEMI_OPEN_FILE_NEAR_KING_PENALTY;
-                eg += SEMI_OPEN_FILE_NEAR_KING_PENALTY;
-            }
-        }
-    }
-    if (file <= 6) {
-        
-        bool semi_open = !(our_pawns & file_masks[file + 1]);
-        if (semi_open){
-            if (!(their_pawns & file_masks[file + 1])){
-                if ((file_masks[file + 1] & game->pieces[!side][ROOK]) || file_masks[file + 1] & game->pieces[!side][QUEEN]){
-                    mg += OPEN_FILE_NEAR_KING_WITH_ATTACKER;
-                    eg += OPEN_FILE_NEAR_KING_WITH_ATTACKER;
-                    
-                } else {
-                    mg += OPEN_FILE_NEAR_KING_PENALTY;
-                    eg += OPEN_FILE_NEAR_KING_PENALTY;
-                    
-                }
-            } else {
-                mg += SEMI_OPEN_FILE_NEAR_KING_PENALTY;
-                eg += SEMI_OPEN_FILE_NEAR_KING_PENALTY;
-            }
-        }
-    }
-
-    bool semi_open = !(our_pawns & file_masks[file]);
-    if (semi_open){
-        if (!(their_pawns & file_masks[file])){
-                if ((file_masks[file] & game->pieces[!side][ROOK]) || file_masks[file] & game->pieces[!side][QUEEN]){
-                    mg += OPEN_FILE_FROM_KING_WITH_ATTACKER;
-                    eg += OPEN_FILE_FROM_KING_WITH_ATTACKER;
-                    
-                } else {
-                    mg += OPEN_FILE_NEAR_KING_PENALTY;
-                    eg += OPEN_FILE_NEAR_KING_PENALTY;
-                    
-                }
-                mg += OPEN_MIDDLE_FILE_NEAR_KING_ADDITIONAL_PENALTY;
-                eg += OPEN_MIDDLE_FILE_NEAR_KING_ADDITIONAL_PENALTY;
-            } else {
-            mg += SEMI_OPEN_FILE_NEAR_KING_PENALTY;
-            eg += SEMI_OPEN_FILE_NEAR_KING_PENALTY;
-        }
-    }
-
-    // diagonals
-    int open_diagonal_penalties = 0;
-    int n = king_sq + push_direction[side] * 8;
-    // int e = king_sq + 1;
-    // int w = king_sq - 1;
-    // int s = king_sq - 8;
-    if (n >= 0 && n <= 63){
-        uint64_t diagonals_near_king_without_blockers = bishop_moves[n];
-        bool semi_open_diagonal = !(diagonals_near_king_without_blockers & our_pawns);
-        if (semi_open_diagonal){
-            if (!(diagonals_near_king_without_blockers & their_pawns)){
-                if ((diagonals_near_king_without_blockers & game->pieces[!side][QUEEN]) || diagonals_near_king_without_blockers & game->pieces[!side][BISHOP]){
-                    mg += OPEN_DIAGONAL_NEAR_KING_WITH_ATTACKER;
-                    eg += OPEN_DIAGONAL_NEAR_KING_WITH_ATTACKER;
-                
-                } else {
-                    mg += OPEN_DIAGONAL_NEAR_KING_PENALTY;
-                    eg += OPEN_DIAGONAL_NEAR_KING_PENALTY;
-                
-                }
-            } else {
-                mg += SEMI_OPEN_DIAGONAL_NEAR_KING_PENALTY;
-                eg += SEMI_OPEN_DIAGONAL_NEAR_KING_PENALTY;
-            
-            }
-        }
-    }
-    
-    uint64_t diagonals_from_king_without_blockers = bishop_moves[king_sq];
-    if (!(diagonals_from_king_without_blockers & our_pawns)){
-        if (!(diagonals_from_king_without_blockers & their_pawns)){
-            if ((diagonals_from_king_without_blockers & game->pieces[!side][QUEEN]) || diagonals_from_king_without_blockers & game->pieces[!side][BISHOP]){
-                mg += OPEN_DIAGONAL_FROM_KING_WITH_ATTACKER;
-                eg += OPEN_DIAGONAL_FROM_KING_WITH_ATTACKER;
-                
-            } else {
-                mg += OPEN_DIAGONAL_FROM_KING_PENALTY;
-                eg += OPEN_DIAGONAL_FROM_KING_PENALTY;
-                
-            }
+    // checks and contact checks
+    // a check is safe if it is not tdped
+    uint64_t pcheck = checks[PAWN] & masks->am_p[side][PAWN];
+    if (pcheck){
+        if (pcheck & safe){
+            s += eval_params[ep_idx.ks_safe_checks[PAWN]];
         } else {
-            mg += SEMI_OPEN_DIAGONAL_NEAR_KING_PENALTY;
-            eg += SEMI_OPEN_DIAGONAL_NEAR_KING_PENALTY;
+            
+            s += eval_params[ep_idx.ks_unsafe_checks[PAWN]];
+        }
+    }
+    uint64_t ncheck = checks[KNIGHT] & masks->am_p[side][KNIGHT];
+    if (ncheck){
+        if (ncheck & safe){
+            s += eval_params[ep_idx.ks_safe_checks[KNIGHT]];
+        } else {
+            s += eval_params[ep_idx.ks_unsafe_checks[KNIGHT]];
+        }
+    }
+
+    
+
+    uint64_t bcheck = checks[BISHOP] & masks->am_p[side][BISHOP];
+    if (bcheck){
+        if (bcheck & safe){
+            s += eval_params[ep_idx.ks_safe_checks[BISHOP]];
+        } else {
+            s += eval_params[ep_idx.ks_unsafe_checks[BISHOP]];
+        }
+    }
+
+    uint64_t rcheck = checks[ROOK] & masks->am_p[side][ROOK];
+    if (rcheck){
+        if (rcheck & safe){
+            s += eval_params[ep_idx.ks_safe_checks[ROOK]];
+        } else {
+            
+            s += eval_params[ep_idx.ks_unsafe_checks[ROOK]];
+        }
+        // TODO this should probably be masks->datk since we already attack this square with the rook
+        if (rcheck & king_moves[enemy_king_sq] & (~masks->am_nk[!side] & masks->am[side])){
+            s += eval_params[ep_idx.ks_rook_contact_check];
+        }
+    }
+    uint64_t qcheck = checks[QUEEN] & masks->am_p[side][QUEEN];
+    if (qcheck){
+        if (qcheck & safe){
+            s += eval_params[ep_idx.ks_safe_checks[QUEEN]];
+        } else {
+            
+            s += eval_params[ep_idx.ks_unsafe_checks[QUEEN]];
+        }
+
+        // uses the xr mask to determine if we have backup on the contact square
+        uint64_t qm = qcheck & king_moves[enemy_king_sq];
+        if (qm & ((~masks->am_nk[!side] & masks->am[side]) | (qm & masks->am_xr_nq[side]))){
+            s += eval_params[ep_idx.ks_queen_contact_check];
+        }
+    }
+
+    // correction for hanging pieces
+    // extra correction for hanging pieces next to the king. they might blow up threat but actually just be hanging and taken in the next turn. so this avoids the horizon issue
+    for (int p = KNIGHT; p < KING; p++){
+        uint8_t * pl = game->piece_list[side][p];
+        for (uint8_t pos = *pl; pos != SQ_NONE; pos = *++pl){
+            uint64_t mz = piece_attacks[side][p][game->piece_index[pos]] & enemy_king_zone;
+            if (mz){
+
+                if ((bits[pos] & masks->tdp[side] & king_moves[enemy_king_sq]) && side != game->side_to_move){
+                    s += eval_params[ep_idx.ks_threat_correction[p]];
+
+                } else if (mz & king_moves[enemy_king_sq]){
+                    s += eval_params[ep_idx.ks_akz[p]];
+                }
+            }
+        }
+    }
+
+    // emtpy squares the king can escape to
+    uint8_t empty = __builtin_popcountll(king_moves[enemy_king_sq] & ~game->board_pieces[BOTH] & ~masks->am[side]);
+
+    // defended squares in the king zone
+    uint8_t enemy_king_defended_squares = __builtin_popcountll(enemy_king_zone & masks->am_nk[!side] | (king_moves[enemy_king_sq] & ~masks->am[side]));
+
+    // pawn shield only relevant early and actually gets negated late
+    uint64_t pawn_shield =  game->pieces[!side][PAWN] & pawn_shield_masks[!side][enemy_king_sq];    
+    uint8_t shield = __builtin_popcountll(pawn_shield);
+
+    // king moves defended by a minor piece (minor = better)
+    uint8_t def_minor = __builtin_popcountll(masks->am_m[!side] & king_moves[enemy_king_sq]);
+
+    // double attacked squares next to the king
+    uint64_t wksq = masks->datk[side] & ~masks->am_nk[!side] & king_moves[enemy_king_sq];
+
+    // nonpawn attackers in the king zone
+    uint8_t aikz = __builtin_popcountll(game->board_pieces[side] & enemy_king_zone & ~game->pieces[side][PAWN]);
+
+    // sum all of them up
+    s += eval_params[ep_idx.ks_aikz[MIN(aikz, 7)]];
+    s += eval_params[ep_idx.ks_defended_squares_kz[MIN(enemy_king_defended_squares, 23)]];
+    s += eval_params[ep_idx.ks_def_minor[MIN(def_minor, 7)]];
+    if (more_than_one(wksq)){
+        s += eval_params[ep_idx.ks_weak];
+    }
+    s += eval_params[ep_idx.ks_pawn_shield[MIN(shield, 3)]];
+    s += eval_params[ep_idx.ks_empty[MIN(empty, 7)]];
+
+    return s;
+}
+
+// this idea was taken straight from kohai but isn't in use anymore. it found if a king was able to stop a pawn in endgame, but in texel tuning I found this was often getting poor signal and sometimes even getting heavily negated. the code definitely worked but I think there are too many edge cases for it to work properly.
+
+static inline bool material_is_lone_king(Game * game, Side side){
+    if (game->pieces[side][KNIGHT] == 0 && game->pieces[side][BISHOP] == 0 && game->pieces[side][ROOK] == 0 && game->pieces[side][QUEEN] == 0) return true;
+    return false;
+}
+static inline bool passer_is_unstoppable(Game * game, Side side, int pos, EvalMasks * masks){
+    if (!material_is_lone_king(game, (Side)!side)) return false;
+
+    if (game->board_pieces[BOTH] & in_front_file_masks[side][pos] || masks->am[!side] & in_front_file_masks[side][pos]) return false; 
+
+    if (manhattan_distance[game->st->k_sq[!side]][pos] >= 2) return true;
+    if (side ? SQ_TO_RANK[pos] >= 5 : SQ_TO_RANK[pos] <= 2 && (king_moves[game->st->k_sq[!side]] & in_front_file_masks[side][pos]) == 0) return true;
+
+    return false;
+}
+
+
+static inline int evaluate_passers(Game * game, Side side, EvalMasks * masks){
+
+    Score s = 0;
+    uint64_t passers = masks->passers[side];
+    int passers_on_seven = 0;
+    uint8_t pr_cnt = 0;
+
+    // loop through all passers
+    while (passers){
+
+        int pos = __builtin_ctzll(passers);
+        passers = passers & (passers - 1);
+        
+        int rank = SQ_TO_RANK[pos];
+        if (rank == (side ? 6 : 1) || (passers_on_seven && side ? rank >= 5 : rank <= 2)){
+            passers_on_seven++;
+        }
+        int file = SQ_TO_FILE[pos];
+        int push = rank + push_direction[side];
+        uint64_t f_sq = rank_masks[push] & file_masks[file];
+        // if we are defended in front (can push)
+        if (f_sq & masks->tdp[side]){
+            s += eval_params[ep_idx.passer_deficit];
+        } else if (f_sq & masks->am[side]){
+            s += eval_params[ep_idx.passer_supported];
+        }
+        // if we are blocked by an enemy piece
+        if (in_front_file_masks[side][pos] & game->board_pieces[!side]){
+            s += eval_params[ep_idx.passer_blocked];
+        }
+
+        // if we are defended and about to promote, we are most likely locking enemy pieces into defending our promotion square. this bonus reflects that
+        if (bits[pos] & ~masks->tdp[side] && (rank == 6 || rank == 1)){
+            if (promotion_ranks[side] & game->pieces[!side][ROOK]){
+                s += eval_params[ep_idx.opponent_rook_stuck_on_promo_rank];
+            }
+            
+        }
+        uint64_t rf = file_masks[file] & game->pieces[side][ROOK];
+        
+        if (rf){
+            if (rf & ~in_front_file_masks[side][pos]){
+                s += eval_params[ep_idx.rook_on_passer_file];
+            }
+            uint8_t rpos = __builtin_ctzll(rf);
+
+            // defer this until after to check for other passers about to promote, since that makes this irrelevant
+            if ((f_sq & bits[rpos]) && (rank == 6 || rank == 1)){
+                pr_cnt += 1;
+            }
             
         }
     }
+
+    // more than one passer about to promote
+    if (passers_on_seven > 1) s += eval_params[ep_idx.extra_passers_on_seven];
+
+    // if there aren't multiple pawns about to promote, our rook might be stuck defending the pawn, which is especially bad if it is directly in front of it. not all of the time, though
+    if (passers_on_seven <= 1 && pr_cnt) s += eval_params[ep_idx.rook_stuck_in_front_of_passer];
+
+    return s;
     
-    // make this other piece bonus have a bigger ring than just the ring so it doesn't make us cramp our king
-    // int shield_score = (shield) * texel_weights[params.pawn_shield] * sign; 
-    // return ss + open_file_penalties + open_diagonal_penalties + shield;
-    *out_mg += mg;
-    *out_eg += eg;
+}
+
+
+/* @brief this used to be a much much bigger function using threat deficit and attacking weak pawns etc but now it is much smaller. due to testing and texel tuning, I discovered these heuristics weren't actually getting good signal at all, and the engine performs better without them. it's a shame since I think they were neat. I may try again some day. */
+
+static inline Score evaluate_threats(Game * game, Side side, EvalMasks * masks){
+
+
+    
+    Score s = 0;
+    // enemy pieces (no pawns)
+    uint64_t ep_np = game->board_pieces[!side] & ~game->pieces[!side][PAWN];
+    
+    uint64_t b = ep_np & (masks->am_p[side][KNIGHT] | masks->am_p[side][BISHOP]);
+    while (b){
+        uint8_t pos = __builtin_ctzll(b);
+        b = b & (b - 1);
+
+        s += eval_params[ep_idx.threat_by_minor[game->piece_at[pos]]];
+    }
+
+    b = ep_np & (masks->am_p[side][ROOK] | masks->am_p[side][QUEEN]);
+
+    while (b){
+        uint8_t pos = __builtin_ctzll(b);
+        b = b & (b - 1);
+
+        s += eval_params[ep_idx.threat_by_major[game->piece_at[pos]]];
+    }
+
+    uint64_t edef = ep_np & (masks->am_p[!side][PAWN] | masks->datk[!side]);
+    uint64_t weak = ep_np & ~edef & masks->tdp[!side];
+
+    // if they have more than one weak piece (threat deficit, we are attacking multiple nonpawns at once)
+    if (more_than_one(weak)){
+        s += eval_params[ep_idx.weak_pieces];
+    }
+   
+    // pawn push attacks against nonpawns
+    uint8_t pp_c = __builtin_popcountll(masks->sppa[side] & ep_np);
+    s += eval_params[ep_idx.safe_pawn_push_attacks[MIN(pp_c, 15)]];
+
+    // safe pawns attacking nonpawns (they cannot be captured easily)
+    uint64_t sp = game->pieces[side][PAWN] & masks->safe[side];
+    uint8_t sp_c = __builtin_popcountll(pawn_attacks(side, sp) & ep_np);
+    s += eval_params[ep_idx.safe_pawn_attacks[MIN(sp_c, 15)]];
+    
+
+    return s;
+}
+
+static inline Score evaluate_material(Game * game, Side side, EvalMasks * masks, uint64_t piece_attacks[COLOR_MAX][PIECE_TYPES][PIECE_MAX]){
+
+    Score s = 0;
+    uint64_t fp = game->board_pieces[side];
+    uint64_t ep = game->board_pieces[!side];
+    int phase = game->phase;
+    uint64_t fpawns = game->pieces[side][PAWN];
+    uint64_t epawns = game->pieces[!side][PAWN];
+    uint8_t enemy_king_sq = __builtin_ctzll(game->pieces[!side][KING]);
+
+    // bishop pair only when opposite colored
+    int bc = 0;
+    if (game->pieces[side][BISHOP] & COLOR_SQUARES[BLACK]){
+        bc += 1;
+    }
+    if (game->pieces[side][BISHOP] & COLOR_SQUARES[WHITE]){
+        bc += 1;
+    }
+    if (bc == 2){
+        s += eval_params[ep_idx.bishop_pair];
+    }
+
+    // this idea is straight from stockfish, remove pawns that are stuck from our mobility count, since they are obviously less valuable
+    uint64_t pfsq = game->pieces[side][PAWN] & (side ? game->board_pieces[BOTH] << 8 : game->board_pieces[BOTH] >> 8);
+    // determine outpost mask (needs pawn push attacks from the enemy side to determine if the outpost could be refuted easily by simply pushing a pawn)
+    uint64_t out = masks->wsq[!side] & center_squares_mask & ~masks->sppa[!side];
+
+    // piece list iteration (SF style)
+    for (int p = KNIGHT; p < KING; p++){
+        uint8_t * pl = game->piece_list[side][p];
+        int c = 0;
+        for (uint8_t pos = *pl; pos != SQ_NONE; pos = *++pl){
+            c++;
+            uint64_t m = piece_attacks[side][p][game->piece_index[pos]];
+
+            uint64_t mob = m & ~masks->am_p[!side][PAWN];
+            uint64_t smob = m & ~masks->am[!side] & ~masks->tdp[side];
+            int count = __builtin_popcountll(mob);
+            uint64_t b = bits[pos];
+
+
+            // mobility count
+            s += eval_params[ep_idx.mobility[p][count]];
+
+            // outpost eval
+            if (p == BISHOP || p == KNIGHT){
+                int file = SQ_TO_FILE[pos];
+                if (p == KNIGHT){
+                    if (b & out){
+                        s += eval_params[ep_idx.outpost_occ];
+                    }
+                }
+
+                // if (m & masks->out[side]){
+                //     s += eval_params[ep_idx.outpost_control];
+                // }
+                // can we enter enemy territory? (3 ranks)
+                if (!(mob & ET3[side])){
+                    s += eval_params[ep_idx.minor_cannot_enter_et];
+                }
+            }
+
+
+            // if no safe mobility, and we are already in a threat deficit square, give a penalty
+            if (smob == 0 && (masks->tdp[side] & b)){
+                s += eval_params[ep_idx.unstoppable_attack];
+            }
+
+
+            if (p == ROOK){
+            
+                int file = SQ_TO_FILE[pos];
+                int rank = SQ_TO_RANK[pos];
+
+
+                if (!(fpawns & file_masks[file])) {
+                    if (!(epawns & file_masks[file])) {
+                        s += eval_params[ep_idx.rook_open];
+                    } else {
+                        s += eval_params[ep_idx.rook_semi_open];
+                    }
+                }
+                if (m & game->pieces[side][ROOK]){
+                    s += eval_params[ep_idx.connected_rook];
+            
+                }
+                
+            } else if (p == QUEEN){
+            
+                // are we connected to sliders?
+                if (rook_moves[pos] & m & game->pieces[side][ROOK]){
+                    s += eval_params[ep_idx.qr_connected];
+                }
+                if (bishop_moves[pos] & m & game->pieces[side][BISHOP]){
+                    s += eval_params[ep_idx.qb_connected];
+                }
+
+                // idea is from SF, using check info we can detect pins
+                uint64_t qp;
+                if (slider_blockers(game, (Side)!side, game->pieces[!side][ROOK] | game->pieces[!side][BISHOP], pos, &qp)){
+                    s += eval_params[ep_idx.weak_queen];
+                }
+            }
+            
+        }
+    }
+
+    
+    return s;
+
 }
 
 
 
-/* @brief evaluates overall safety by usual defender-attacker ideas, used to use manhattan distance but it was overengineered. needs work though */
-// void evaluate_king_safety(Game *game, Side side, int  * mg, int  * eg, uint64_t our_attack_mask, uint64_t enemy_attack_mask);
-static inline void evaluate_king_safety(Game *game, Side side, int  * mg, int  * eg, uint64_t our_attack_mask, uint64_t enemy_attack_mask){
-    // if (game->phase < 10) return 0;
 
-    int king_sq = bit_scan_forward(&game->pieces[side][KING]);
+/* apply corrective history based on various different hashed score bonuses. basically the idea behind this is to minimize out evaluation's bias based on how far off we were during search */
+static inline int corrhist_eval(Game * game, ThreadData * td, SearchStack * stack, Side side){
+    const int w = 256;
+    const int pw = 128;
 
-    int  attack_score = 0;
-    // small penalty for squares attacked inside of the king zone
-    int far_attacks = bit_count(king_zone_masks[king_sq] & enemy_attack_mask);
-    int zone_attacks = bit_count(king_zone_masks[king_sq] & game->board_pieces[!side]);
-    attack_score += zone_attacks * KING_ZONE_ATTACK_PENALTY;
+    // pawns
+    int16_t cp = td->corrhist_p[side][game->st->piece_key[PAWN] & CORRHIST_MASK] * sp.corr_pawn_weight / sp.corrhist_weight;
+
+    // nonpawns
+    int16_t cnp_w = td->corrhist_nonpawns_w[side][game->st->nonpawn_key[WHITE] & CORRHIST_MASK] * sp.corr_np_weight / sp.corrhist_weight;
+    int16_t cnp_b = td->corrhist_nonpawns_b[side][game->st->nonpawn_key[BLACK] & CORRHIST_MASK] * sp.corr_np_weight / sp.corrhist_weight;
+
+    // material
+    int16_t cm = td->corrhist_material[side][game->st->material_key & CORRHIST_MASK] * sp.corr_mat_weight / sp.corrhist_weight;
     
+    // kbn and kqr are taken straight from yukari. these are the highest performing corrhists and I can't thank them enough for the idea.
 
+    // king bishop knight
+    uint64_t kbn = game->st->piece_key[KING] ^ game->st->piece_key[BISHOP] ^ game->st->piece_key[KNIGHT];
 
-    int  defense_score = 0;
-    int close_defenders = bit_count(king_zone_masks[king_sq] & our_attack_mask);
-    int zone_defense = bit_count(king_zone_masks[king_sq] & game->board_pieces[side]);
-    defense_score += zone_defense * KING_ZONE_DEFENSE_SCORE + close_defenders * 0.25;
+    int ckbn = td->corrhist_kbn[side][kbn & CORRHIST_MASK] * sp.corr_kbn_weight / sp.corrhist_weight;
+
+    // king queen rook
+    uint64_t kqr = game->st->piece_key[KING] ^ game->st->piece_key[QUEEN] ^ game->st->piece_key[ROOK];
+    int ckqr = td->corrhist_kqr[side][kqr & CORRHIST_MASK] * sp.corr_kqr_weight/ sp.corrhist_weight;
+
+    // continuation correction
+    // this one's interesting. it is based on the same premise as continuation history, but applied to eval. basically, after a specific move that was responded to with another move, we are typically off by some amount, and we apply that here
+    Move m = (stack-1)->current_move;
+    int cr = 0;
+    if (m){
+        uint8_t to = move_to(m);
+        cr = (*(stack-2)->cr)[game->piece_at[to]][to] * sp.corr_ch_weight / sp.corrhist_weight;
+        
+    }
     
-
-    
-    *mg += attack_score + defense_score;
-    *eg += attack_score + defense_score;
+    int c = (cp + cnp_w + cnp_b + ckqr + ckbn + cr) / sp.corrhist_grain;
+    return c;
 }
+
+
+
+// not being used currently, but the credit it to lync for some of this. just attempts to scale back eval if it is going to be a draw but our engine doesn't know it yet
+static inline void draw_detection(Game * game, int * eval){
+    
+    int e = *eval;
+    if (game->pieces[WHITE][PAWN] == 0 && game->pieces[BLACK][PAWN] == 0 && game->phase <= 5){
+
+        switch(game->phase){
+            case 5:
+                if (__builtin_popcountll(game->pieces[WHITE][ROOK]) == 1 && __builtin_popcountll(game->pieces[BLACK][ROOK]) == 1){
+                    e >>= 1;
+                } 
+                break;
+            case 4:
+                if (__builtin_popcountll(game->pieces[WHITE][ROOK]) != 0 &&
+                    (__builtin_popcountll(game->pieces[WHITE][BISHOP] | game->pieces[WHITE][KNIGHT]) != 0) &&
+                    __builtin_popcountll(game->pieces[BLACK][ROOK]) != 0 &&
+                    (__builtin_popcountll(game->pieces[BLACK][BISHOP] | game->pieces[BLACK][KNIGHT]) != 0)){
+                
+                    e >>= 1;
+                }
+                break;
+            case 3:
+                if (__builtin_popcountll(game->pieces[WHITE][KNIGHT] == 2 || __builtin_popcountll(game->pieces[BLACK][KNIGHT] == 2))){
+                    e = 0;
+                }
+                e >>= 1;
+                break;
+            case 2:
+                {
+                    int w_knights = __builtin_popcountll(game->pieces[WHITE][KNIGHT]);
+                    if ((w_knights + __builtin_popcountll(game->pieces[BLACK][KNIGHT]) == 2) ||
+                        w_knights + __builtin_popcountll(game->pieces[WHITE][BISHOP]) == 1){
+                            e = 0;
+                        }
+                }
+                break;
+            case 1:
+                break;
+            case 0:
+                e = 0;
+            default:
+                break;
+        }
+
+        
+
+        
+    }
+    *eval = e;
+    
+
+    
+}
+
+
+
 /* 
     @brief the giant eval function. uses the pawn hash to help out on the load. used to be in int space but now due to texel complication uses int s. i intend to go back, however. returns based on side to move, but everything is calculated from white as positive
-    @param king_threat_value a pointer used for reducing pruning when a king is under heavy threat (wip)
 */
 
-static inline int evaluate(Game * game, Side side, SearchData * search_data, int * king_threat_value){
-    int w_mat_mg = 0;
-    int w_mat_eg = 0;
-    int b_mat_mg = 0;
-    int b_mat_eg = 0;
-    int sign = 1;
-    int mg = 0;
-    int eg = 0;
+static inline int evaluate(Game * game, ThreadData * td, SearchStack * stack, Side side, SearchData * search_data, int depth, int alpha, int beta, bool * lazy, bool pv_node, bool debug){
 
+    EvalDebug dbg;
 
-    int p_mg = 0; int p_eg = 0;
-    int king_pawn_shield = 0;
+    // make sure masks are init to zero since we or onto them
+    EvalMasks masks;
+    memset(&masks, 0, sizeof(EvalMasks));
+    Score s = 0;
+    int phase = game->phase;
+    dbg = (EvalDebug){0};
+
     // search for pawn hash entry
-    int  pawn_score = 0;
     PawnHashEntry * entry = NULL;
-    uint64_t black_pawn_attacks = 0;
-    uint64_t white_pawn_attacks = 0;
-    int ktv = 0;
-    entry = search_for_pawn_hash_entry(game, game->pawn_key);
+    entry = search_for_pawn_hash_entry(game, game->st->piece_key[PAWN]);
     search_data->pawn_hash_probes += 1;
+
     if (entry){
+
+        // entry retrieved, we will use the masks later (lazy things)
         search_data->pawn_hash_hits += 1;
-        black_pawn_attacks = entry->b_pawn_attacks;
-        white_pawn_attacks = entry->w_pawn_attacks;
-        king_pawn_shield = entry->king_safety;
-        mg += entry->mg_score;
-        eg += entry->eg_score;
+        s += entry->s;
+        
     } else {
         
-        int w_ps_mg = 0, w_ps_eg = 0;
-        int b_ps_mg = 0, b_ps_eg = 0;
-        white_pawn_attacks = evaluate_pawn_structure(game, WHITE, &w_ps_mg, &w_ps_mg); 
-        black_pawn_attacks = evaluate_pawn_structure(game, BLACK, &b_ps_mg, &b_ps_eg);
-        int b_sp = 0;
-        int w_sp = 0;
-        // evaluate_pawn_space(game,&w_sp, &b_sp);
-        int pawn_mg = w_ps_mg - b_ps_mg + w_sp - b_sp;
-        int pawn_eg = w_ps_eg - b_ps_eg + w_sp - b_sp;
-        create_new_pawn_hash_entry(game, game->pawn_key, pawn_mg, pawn_eg, king_pawn_shield, white_pawn_attacks, black_pawn_attacks);
-        mg += pawn_mg;
-        eg += pawn_eg;
+        masks.passers[WHITE] = 0;
+        masks.passers[BLACK] = 0;
+        // get scores for black and white
+        Score pw = evaluate_pawn_structure(game, WHITE, &masks); 
+        Score pb = evaluate_pawn_structure(game, BLACK, &masks);
+
+        // create a pawn hash entry with our masks and score
+        create_new_pawn_hash_entry(game, game->st->piece_key[PAWN], pw - pb, &masks);
+        s += pw - pb;
     }
 
-    uint64_t w_attack_mask = evaluate_material_weighted(game, WHITE, &w_mat_mg, &w_mat_eg, black_pawn_attacks);
-    uint64_t b_attack_mask = evaluate_material_weighted(game, BLACK, &b_mat_mg, &b_mat_eg, white_pawn_attacks);
 
-    // // evaluate hanging pieces
-    uint64_t w_undefended = game->board_pieces[WHITE] ^ (game->board_pieces[WHITE] & w_attack_mask);
-    uint64_t b_undefended = game->board_pieces[BLACK] ^ (game->board_pieces[BLACK] & b_attack_mask);
-    int w_hanging = 0;
-    int b_hanging = 0;
-    while (w_undefended){
-        int pos = pop_lsb(&w_undefended);
-        if ((1ULL << pos) & b_attack_mask){
-            
-            w_hanging += HANGING_PIECE_PENALTY[game->piece_at[pos]] * 2;
-        } else {
-            
-            w_hanging += HANGING_PIECE_PENALTY[game->piece_at[pos]];
-        }
-    }
-    while (b_undefended){
-        int pos = pop_lsb(&b_undefended);
-        if ((1ULL << pos) & w_attack_mask){
-            
-            b_hanging += HANGING_PIECE_PENALTY[game->piece_at[pos]] * 2;
-        } else {
-            
-            b_hanging += HANGING_PIECE_PENALTY[game->piece_at[pos]];
-        }
-    }
-    mg += w_hanging - b_hanging;
-    eg += w_hanging - b_hanging;
+    s += game->st->psqt_score[WHITE] - game->st->psqt_score[BLACK];
+    s += game->st->material_score[WHITE] - game->st->material_score[BLACK];
 
+
+    // this logic is commented out for now but is a lazy eval implementation. for spsa and tuning i have disabled it momentarily for stability, but will tune it later. it is also the reason why our pawn masks are only initialized after, to make everything as efficient as possible
 
     
-    int w_attacked_by_pawns = bit_count(black_pawn_attacks & (game->board_pieces[WHITE] & ~game->pieces[WHITE][PAWN]));
-    int b_attacked_by_pawns = bit_count(white_pawn_attacks & (game->board_pieces[BLACK] & ~game->pieces[BLACK][PAWN]));
-    mg += w_attacked_by_pawns * PAWN_BLOCKERS_PENALTY - b_attacked_by_pawns * PAWN_BLOCKERS_PENALTY;
-    eg += w_attacked_by_pawns * PAWN_BLOCKERS_PENALTY - b_attacked_by_pawns * PAWN_BLOCKERS_PENALTY;
-    
-    mg += w_mat_mg - b_mat_mg;
-    eg += w_mat_eg - b_mat_eg;
-    
-    // mg += game->psqt_evaluation_mg[WHITE] - game->psqt_evaluation_mg[BLACK];
-    // eg += game->psqt_evaluation_eg[WHITE] - game->psqt_evaluation_eg[BLACK];
+    // int pmg = 0;
+    // if (masks.passers[WHITE] & rank_masks[7] || masks.passers[WHITE] & rank_masks[6] || masks.passers[BLACK] & rank_masks[1] || masks.passers[BLACK] & rank_masks[0]) pmg += 740; 
+    // int l1 = 600 + pmg;
+    int corrhist = corrhist_eval(game, td, stack, side);
+    // int l1e = ((eg * (MAX_PHASE - phase)) + (mg * phase)) / MAX_PHASE;
 
-    int w_rf_mg = 0, w_rf_eg = 0;
-    int b_rf_mg = 0, b_rf_eg = 0;
-    evaluate_rook_files(game, WHITE, &w_rf_mg, &w_rf_eg); 
-    evaluate_rook_files(game, BLACK, &b_rf_mg, &b_rf_eg);
-    mg += w_rf_mg - b_rf_mg;
-    eg += w_rf_eg - b_rf_eg;
-    int w_ks_mg = 0, w_ks_eg = 0;
-    int b_ks_mg = 0, b_ks_eg = 0;
-    evaluate_king_safety(game, WHITE, &w_ks_mg, &w_ks_eg, w_attack_mask, b_attack_mask);  
-    evaluate_king_safety(game, BLACK, &b_ks_mg, &b_ks_eg, b_attack_mask, w_attack_mask);
-    // evaluate_king_pawn_safety(game, WHITE, &w_ks_mg, &w_ks_eg);  
-    // evaluate_king_pawn_safety(game, BLACK, &b_ks_mg, &b_ks_eg);
-    if (side == WHITE){
-        ktv += w_ks_mg;
-    } else {
-        ktv += b_ks_mg;
-    }
-    mg += w_ks_mg - b_ks_mg;
-    eg += w_ks_eg - b_ks_eg;
-
-    if (game->phase < 10){
-        int  eg_king = evaluate_endgame_king(game, WHITE) - evaluate_endgame_king(game, BLACK);
-        eg += eg_king;
-        
-    }
-
-    // if (game->phase > 20){
-    //     int eval = evaluate_early_game_development(game, WHITE) - evaluate_early_game_development(game, BLACK);
-    //     mg += eval;
-    //     eg += eval;
+    // l1e = side ? corrhist + l1e : corrhist - l1e; 
+    // if (l1e >= beta + l1 || l1e <= alpha - l1) {
+    //     search_data->lazy_cutoffs_s1 += 1;
+    //     *lazy = true;
+    //     return l1e;
     // }
     
-    int  pin_score = evaluate_pins(game, WHITE) - evaluate_pins(game, BLACK);
-    mg += pin_score;
-    eg += pin_score;
+    // this logic is sort of expensive but necessary, we need to set up masks for eval before evaluating material because we need to know where each side attacks. it is actually possible to split this up a bit more and have another lazy stage (had it before), but would require refactor, retuning, and probably sacrificing some positional accuracy in evaluate_material
 
+    // per piece attack masks indexed by piece list index (piece count when piece was set)
+    uint64_t piece_attacks[COLOR_MAX][PIECE_TYPES][PIECE_MAX];
+    if (entry){
+        masks.am_p[WHITE][PAWN] = entry->w_atk;
+        masks.am_p[BLACK][PAWN] = entry->b_atk;
+        masks.passers[WHITE] = entry->w_passers;
+        masks.passers[BLACK] = entry->b_passers;
+        
+    }
+    generate_attack_mask_and_eval_mobility(game, WHITE, &masks, piece_attacks);
+    generate_attack_mask_and_eval_mobility(game, BLACK, &masks, piece_attacks);
 
-    int e = ((eg * (MAX_PHASE - game->phase)) + (mg * game->phase)) / MAX_PHASE;
+    // king danger is here as a historic idea. it was used to push lazy even further by making a cheap king safety check instead of the full thing since king safety is expensive. so it is only actually used as a margin. however, it required incremental logic to keep attackers to the king zone updated in make / undo, which was painful and slow. now, our engine is much faster without it.
+
+    // int w_akz = 0, b_akz = 0;
+    // int w_kd = compute_king_danger(game, &masks, WHITE, &w_akz);
+    // int b_kd = compute_king_danger(game, &masks, BLACK, &b_akz);
+    // int mkd = MAX(w_kd, b_kd);
+    // mkd = KING_DANGER[(size_t)mkd];
+
+    // lazy stage 2
     
+    // int smargin = 150 + mkd + pmg;
+    // int pe = ((eg * (MAX_PHASE - phase)) + (mg * phase)) / MAX_PHASE;
+
+    // if (side == WHITE){
+    
+    //     pe = corrhist + pe;
+    // } else {
+    //     pe = corrhist - pe;
+    
+    // }
+
+    // if (pe >= beta + smargin || pe <= alpha - smargin) {
+    //     search_data->lazy_cutoffs_s2 += 1;
+    //     *lazy = true;
+    //     return pe;
+    // }
+
+    
+
+    // misc per piece eval
+    Score mw = evaluate_material(game, WHITE, &masks, piece_attacks);
+    Score mb = evaluate_material(game, BLACK, &masks, piece_attacks);
+
+    // threats we have on enemy pieces
+    Score tw = evaluate_threats(game, WHITE, &masks);
+    Score tb = evaluate_threats(game, BLACK, &masks);
+
+    // evaluates individual passers
+    Score pw = evaluate_passers(game, WHITE, &masks);
+    Score pb = evaluate_passers(game, BLACK, &masks);
+    
+    // evaluates the threat we have on the enemy king
+    Score kw = evaluate_king_threat(game, WHITE, &masks, piece_attacks);
+    Score kb = evaluate_king_threat(game, BLACK, &masks, piece_attacks);
+
+    s += mw - mb;
+    s += tw - tb;
+    s += pw - pb;
+    s += kw - kb;
+
+
+    int mg = 0, eg = 0;
+    mg = MG(s);
+    eg = EG(s);
+    int e = ((eg * (MAX_PHASE - phase)) + (mg * phase)) / MAX_PHASE;
+
+
+    
+    const int MAX_DEPTH = 32;
     if (side == WHITE){
         
-        return e;
+        int ee = corrhist + e;
+        // draw_detection(game, &ee);
+        return ee * sp.eval_scale;
     } else {
+        int ee = corrhist - e;
+        // draw_detection(game, &ee);
+        return ee * sp.eval_scale;
         
-        return -e;
     }
 }
 
+// detects if a score is mate (used for pruning)
 static inline bool is_mate(int score){
-    return score < -MATE_SCORE + 1 || score > MATE_SCORE - 1;
+    return score < -MATE_SCORE + 500 || score > MATE_SCORE - 500;
 }
-static inline bool is_safe(Game * game, Move * move){
-    if (move->piece == KING){
-        return true;
-    } else if ((move->type == CAPTURE || move->promotion_capture) && piece_values_mg[move->capture_piece] >= piece_values_mg[move->piece]){
-        return true;
-    } else if (move->type == PROMOTION && move->promotion_type != QUEEN){
-        return false;
-    } else {
-        return see(game, move) > 100;
-    }
-}
+
+
+
+
 #endif

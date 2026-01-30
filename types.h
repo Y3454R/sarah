@@ -1,6 +1,7 @@
 #ifndef TYPES_H
 #define TYPES_H
 
+// #include "magic.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -11,10 +12,27 @@
 #include <time.h>
 #include <limits.h>
 #include <assert.h>
+#include <stdatomic.h>
+#include <pthread.h>
 
-/* this file, due to my atypical brain chemistry, is a dumping ground for many many things, not just types. feel free to peruse. */
+#define ASSERT(cond) do { \
+    if (!(cond)) { \
+        fprintf(stderr, \
+            "\nASSERTION FAILED\n" \
+            "Condition: %s\n" \
+            "File: %s\n" \
+            "Line: %d\n", \
+            #cond, __FILE__, __LINE__); \
+        abort(); \
+    } \
+} while (0)
 
 
+
+
+#define ROOK_TABLE_SIZE 102400
+
+#define BISHOP_TABLE_SIZE 5248
 
 #define MAX_MOVES 400
 #define MAX_FEN 87
@@ -27,9 +45,22 @@
 #define RANK_MAX 8
 #define FILE_MAX 8
 #define MATE_SCORE 100000000
-#define DRAW_SCORE -1000000
 #define MAX_PHASE 24
+#define HISTORY_MAX 8192
+#define HISTORY_ADDED 14336
+// #define CAP_HIST_MAX 4000
+#define CAP_HIST_MAX 8192
+// #define CAP_HIST_MAX 16384
+#define CORRHIST_SIZE 16384
+#define CORRHIST_MASK 16383
+#define MAX_THREADS 8
+#define BUCKET_SIZE 4
+#define MAX_PLY 128
+#define PIECE_MAX 16
 
+#define SCORE_NONE -32000
+#define DRAW_SCORE -32000
+#define VALUE_NONE 32001
 
 #define PIECE_OFFSET 0
 #define CASTLING_OFFSET 768
@@ -38,18 +69,29 @@
 #define TT_BIT 23
 #define TT_SIZE (1ULL << TT_BIT)
 #define TT_MASK (TT_SIZE - 1ULL)
-#define EVAL_BIT 21
+#define EVAL_BIT 22
 #define EVAL_SIZE (1ULL << EVAL_BIT)
 #define EVAL_MASK (EVAL_SIZE - 1ULL)
 #define PAWN_BIT 20
 #define PAWN_SIZE (1ULL << PAWN_BIT)
 #define PAWN_MASK (PAWN_SIZE - 1ULL)
-#define COUNTERMOVE_BIT 16
+#define COUNTERMOVE_BIT 21
 #define COUNTERMOVE_TABLE_SIZE  (1ULL << COUNTERMOVE_BIT) 
 #define COUNTERMOVE_MASK (COUNTERMOVE_TABLE_SIZE - 1ULL)
-#define REFUTATION_BIT 16
+#define REFUTATION_BIT 21
 #define REFUTATION_TABLE_SIZE  (1ULL << REFUTATION_BIT) 
 #define REFUTATION_MASK (REFUTATION_TABLE_SIZE - 1ULL)
+
+#define MOVE_NONE 0
+#define MOVE_NULL 65
+#define SQ_NONE 65
+
+typedef enum MoveType {
+    NORMAL    = 0 << 14,
+    PROMOTION = 1 << 14,
+    ENPASSANT = 2 << 14,
+    CASTLE = 3 << 14 
+} MoveType;
 
 struct ParamIndex;
 typedef enum StartEnd {
@@ -68,9 +110,9 @@ typedef enum Relation {
 
 typedef enum Side {
   
-  BLACK,
-  WHITE,
-  BOTH
+  BLACK, // 0
+  WHITE, // 1
+  BOTH // 2
   
 } Side;
 
@@ -80,6 +122,7 @@ typedef enum LateralDirection {
   SOUTH,
   WEST
 } LateralDirection;
+
 typedef enum DiagonalDirection {
   NORTHEAST,
   SOUTHEAST,
@@ -99,6 +142,7 @@ typedef enum UCICommand {
   
   UCI_ISREADY,
   UCI_NEWGAME,
+  UCI_SETOPTION,
   UCI_POSITION,
   UCI_GO,
   UCI_STOP,
@@ -125,6 +169,16 @@ typedef enum CommandType {
 } CommandType;
 
 
+typedef enum PickType {
+
+  PICK_TT_MOVE,
+  PICK_GOOD_CAP,
+  PICK_PROMO,
+  PICK_KILLER,
+  PICK_QUIET,
+  PICK_BAD_CAP
+
+} PickType;
 typedef enum PieceType {
   
   PAWN,
@@ -132,7 +186,8 @@ typedef enum PieceType {
   BISHOP,
   ROOK,
   QUEEN,
-  KING
+  KING,
+  PIECE_NONE
   
 } PieceType;
 
@@ -179,6 +234,16 @@ typedef enum File {
 
 } File;
 
+typedef int16_t ContinuationHistory[PIECE_TYPES + 1][BOARD_MAX];
+// typedef struct Score { int16_t mg; int16_t eg; } Score;
+// typedef int16_t Score[2];
+typedef int32_t Score;
+
+typedef enum NodeType {
+  PV,
+  NON_PV
+} NodeType;
+
 typedef struct ivec2 { int x; int y; } ivec2;
 typedef struct vec2 { float x; float y; } vec2;
 
@@ -194,6 +259,12 @@ typedef struct Player {
   
   
 } Player;
+
+typedef struct ThreatInfo {
+  PieceType p;
+  int sq;
+  uint64_t attacks;
+} ThreatInfo;
 
 typedef struct PieceData {
 
@@ -231,16 +302,29 @@ typedef enum CastleSide {
 
 } CastleSide;
 
-typedef enum MoveType {
 
-  MOVE,
-  CAPTURE,
-  CASTLE,
-  EN_PASSANT,
-  PROMOTION
-  
-} MoveType;
+typedef struct {
+    int w, b;
+} EvalPair;
 
+typedef struct {
+    EvalPair pawn;
+    EvalPair material;
+    EvalPair hanging;
+    EvalPair king_threat;
+    EvalPair king_safety_raw;
+    EvalPair king_safety_scaled;
+    EvalPair rook_files;
+    EvalPair pins;
+    EvalPair development;
+    EvalPair endgame_king;
+
+    int mg_total;
+    int eg_total;
+    int final_score;
+    int phase;
+} EvalDebug;
+        
 typedef struct PolyglotEntry {
   uint64_t key;
   uint16_t move;
@@ -255,6 +339,12 @@ typedef struct {
 } TestPos;
 
 
+typedef enum CastlingRights {
+    CWK = 1 << 0,
+    CWQ = 1 << 1,
+    CBK = 1 << 2,
+    CBQ = 1 << 3
+} CastlingRights;
 
 typedef struct OpeningBook {
 
@@ -282,92 +372,230 @@ typedef struct MovementMasks{
   
 } MovementMasks;
 
+typedef struct SearchParams {
+  
+  int16_t qdelta_margin;
+  int16_t qsee_margin;
+  int16_t check_prune_margin;
+  int16_t rfp_mul;
+  int16_t rfp_base;
+  int16_t rfp_improving;
+  uint8_t rfp_depth;
+  uint8_t razor_depth;
+  int16_t razor_base;
+  int16_t razor_mul;
+  int16_t razor_improving;
+  int16_t nmp_mul;
+  int16_t nmp_base;
+  int16_t nmp_slope;
+  uint8_t probcut_depth;
+  int16_t probcut_base;
+  int16_t probcut_improving;
+  uint8_t iid_depth;
+  uint8_t lmr_depth;
+  uint8_t lmr_move_start;
+  uint16_t lmr_hd;
+  double lmr_cap_mul;
+  double lmr_cap_base;
+  double lmr_quiet_mul;
+  double lmr_quiet_base;
+  uint8_t lmp_depth;
+  uint8_t lmp_base;
+  double lmp_improving;
+  double lmp_depth_pow;
+  uint8_t futility_depth;
+  int16_t futility_base;
+  int16_t futility_mul;
+  int16_t futility_hist_mul;
+  int16_t futility_improving;
+  uint8_t chist_depth;
+  int16_t chist1_margin;
+  int16_t chist2_margin;
+  uint8_t see_depth;
+  int16_t mp_goodcap_margin;
+  double chist1_scale;
+  double chist2_scale;
+  double chist4_scale;
+  double chist6_scale;
+  int16_t see_quiet_margin;
+  int16_t see_nonquiet_margin;
+  uint8_t se_depth;
+  double se_depth_margin;
+  int16_t qhistory_base;
+  int16_t qhistory_mul;
+  int16_t qhpen_base;
+  int16_t qhpen_mul;
+  int16_t chistory_base;
+  int16_t chistory_mul;
+  int16_t chpen_base;
+  int16_t chpen_mul;
+  int16_t beta_bonus;
+  int16_t corr_depth_base;
+  int16_t corrhist_grain;
+  int16_t corrhist_weight;
+  int16_t corrhist_max;
+  int16_t corr_pawn_weight;
+  int16_t corr_np_weight;
+  int16_t corr_mat_weight;
+  int16_t corr_ch_weight;
+  
+  int16_t corr_kbn_weight;
+  int16_t corr_kqr_weight;
+  double eval_scale;
+  int16_t aspiration_base;
+  int16_t aspiration_mul;
+
+} SearchParams;
+
+typedef struct EvalParams {
+
+  Score PIECE_VALUES[PIECE_TYPES];
+  Score P_ISOLATED[8];
+  Score P_DOUBLED;
+  Score P_BACKWARD[8];
+  Score P_CANDIDATE_PASSER[8];
+  Score P_CHAIN;
+  Score MOBILITY[PIECE_TYPES][64];
+  Score BISHOP_PAIR; 
+  Score DEFENDED_PIECE[8];
+  Score OUTPOST_OCC; 
+  Score OUTPOST_CONTROLLED; 
+  Score MINOR_CANNOT_ENTER_ET; 
+  Score SLIDER_BOXED_IN; 
+  Score UNSTOPPABLE_ATTACK; 
+  Score RK_OPEN; 
+  Score RK_SEMI_OPEN; 
+  Score RK_CONNECTED; 
+  Score QR_CONNECTED; 
+  Score QB_CONNECTED; 
+  Score WK_Q; 
+  Score TDP_WEAK_SQ[16];
+  Score TDP_OED_PEN[16];
+  Score ATK_WEAK_P[8];
+  Score SAFE_PAWN_PUSH_ATTACKS[16];
+  Score SAFE_PAWN_ATTACKS[16];
+  Score THREAT_BY_MINOR[PIECE_TYPES];
+  Score THREAT_BY_MAJOR[PIECE_TYPES];
+  Score WEAK_PC[8];
+  Score PASSER_TDP;
+  Score PASSER_SUPPORTED;
+  Score PASSER_BLOCKED;
+  Score OPPONENT_ROOK_STUCK_ON_PROMOTION_RANK;
+  Score ROOK_ON_PASSER_FILE;
+  Score ROOK_STUCK_IN_FRONT_OF_PASSER;
+  Score EXTRA_PASSERS_ON_SEVEN[4];
+  Score SAFE_CHECKS[PIECE_TYPES];
+  Score UNSAFE_CHECKS[PIECE_TYPES];
+  
+  
+} EvalParams;
+
+
 
 typedef struct ParamIndex{
-    int isolated_pawn[2];
-    int doubled_pawn[2];
-    int passed_pawn[2];
-    int backward_pawn[2];
-    int candidate_passer[2];
-    int chained_pawn[2];
-    // int additional_pawn_storm_bonus[2];
 
-    int bishop_pair[2];
-    int rook_semi_open[2];
-    int rook_open[2];
-    int connected_rook_bonus[2];
+    int piece_values[PIECE_TYPES];
 
+    int psqt[PIECE_TYPES][64];
 
-    // int pawn_shield[2];
-    // int pawn_storm_bonus;
+    int isolated_pawn[8];
+    int passed_isolated_pawn[8];
+    int doubled_pawn;
+    int passed_pawn[8];
+    int connected_passer;
+    int backward_pawn[8];
+    int candidate_passer[8];
+    int chained_pawn;
 
-    // int dist_to_center[2];
+    int mobility[PIECE_TYPES][64];
+    int bishop_pair;
+    int bishop_pawn_color[8];
+    int bishop_pawn_color_w_attacker[8];
+    int defended_pc[8];
+    int outpost_occ;
+    int outpost_control;
+    int minor_cannot_enter_et;
+    int slider_boxed_in;
+    int unstoppable_attack;
+    int rook_open;
+    int rook_semi_open;
+    int connected_rook;
+    int qr_connected;
+    int qb_connected;
+    int weak_queen;
+    int tdp_weak_sq[16];
+    int tdp_oed_pen[16];
+    int unsafe[16];
+    int awp[8];
+    int safe_pawn_push_attacks[16];
+    int safe_pawn_attacks[16];
+    int weak_pieces;
+    int threat_by_minor[PIECE_TYPES];
+    int threat_by_major[PIECE_TYPES];
+    int passer_is_unstoppable;
+    int passer_deficit;
+    int passer_supported;
+    int passer_blocked;
+    int opponent_stuck_in_front_of_passer;
+    int opponent_rook_stuck_on_promo_rank;
+    int rook_on_passer_file;
+    int rook_stuck_in_front_of_passer;
+    int extra_passers_on_seven;
 
-    int king_threat_value[2][PIECE_TYPES];
-    // int king_threat_base[2];
-    int open_file_king_penalty[2];
-    int semi_open_file_king_penalty[2];
-    int open_middle_file_king_penalty[2];
-    int semi_open_diag_king_penalty[2];
-    int open_diag_king_penalty[2];
-    int semi_open_diag_from_king_penalty[2];
-    int open_diag_from_king_penalty[2];
+    int ks_safe_checks[PIECE_TYPES];
+    int ks_unsafe_checks[PIECE_TYPES];
+    int ks_double_safe_king_attacks[16];
+    int ks_safe_king_attacks[16];
+    int ks_threat_correction[PIECE_TYPES];
+    int ks_rook_contact_check;
+    int ks_queen_contact_check;
+    int ks_akz[PIECE_TYPES];
+    int ks_aikz[8];
+    int ks_weak;
+    int ks_defended_squares_kz[24];
+    int ks_def_minor[8];
+    int ks_ek_defenders[8];
+    int ks_pawn_shield[3];
+    int ks_empty[8];
 
-    int mobility[2][PIECE_TYPES];
-    // int mobility_eg[PIECE_TYPES];
-
-    int piece_values[2][PIECE_TYPES];
-    // int piece_values_eg[2][PIECE_TYPES];
-
-    int psqt[2][PIECE_TYPES][64];
-    // int psqt_eg[PIECE_TYPES][64];
-    // int psqt_eg;
-
-    // int pawn_storm_psqt[2][64];
-    // int pawn_storm_psqt_eg;
-
-    int queen_rook_connected[2];
-    int queen_bishop_connected[2];
     
-    int king_zone_attackers[2];
-    int king_zone_defenders[2];
-    int king_zone_battery[2];
-    int pawn_blockers_penalty[2];
-    // int attack_tempo[2];
-    // int double_attack[2];
-    int pin_penalty[2];
-    // int pin_attacked_twice_penalty[2];
-    int open_file_near_king_with_attacker[2];
-    int open_file_from_king_with_attacker[2];
-    int open_diag_near_king_with_attacker[2];
-    int open_diag_from_king_with_attacker[2];
+    
 
-    int attacked_by_pawn_penalty[2];
-
+    
     int total_params;
 } ParamIndex;
-typedef struct Move {
 
-  int start_index;
-  int end_index;
-  MoveType type;
-  Side side;
-  PieceType piece;
-  PieceType capture_piece;
-  CastleSide castle_side;
-  PieceType promotion_type;
-  bool promotion_capture;
-  bool double_push;
-  bool loses_rights;
-  CastleSide rights_toggle; // what rights you lose when we execute this move
-  int last_en_passant_square;
-  bool castle_flags[COLOR_MAX][CASTLESIDE_MAX];
-  int score; // for move ordering
-  bool is_checking;
-  // uint64_t old_key;
-  bool good_quiet;
+typedef struct AttackUndo {
+
+  uint8_t id;
+  uint64_t attacks;
+  uint8_t mob_count;
   
-} Move;
+} AttackUndo;
+
+typedef struct Undo {
+
+  uint8_t p_id;
+  uint8_t cap_id;
+  PieceType p;
+  PieceType cp;
+
+} Undo;
+
+typedef uint16_t Move;
+
+
+typedef struct PackedMove {
+  
+  uint8_t start;
+  uint8_t end;
+  uint8_t piece;
+  uint8_t capture_piece;
+  uint8_t type;
+  uint8_t promo_piece;
+  Side side;
+} PackedMove;
+
 
 typedef enum TTType {
   EXACT,
@@ -378,42 +606,97 @@ typedef enum TTType {
 } TTType;
 
 
-// typedef struct TTEntry {
-  
-//   uint64_t key;
-//   int score;
-//   TTType type;
-//   Move best_move;
-//   int depth;
-//   bool has_best_move;
-  
-// } TTEntry;
+
 typedef struct {
     uint64_t key;   
-    // uint64_t key;   
-    uint32_t move32;   
-    bool has_best_move;
-    // Move move;
+    Move move;
     int score;
     int16_t depth;     
     uint8_t type;
     int16_t ply;
-    // uint16_t age;
+    uint16_t gen;
     uint16_t weight;
-    // uint32_t learn;
     bool is_opening_book;
-    // int eval;
-    // bool has_eval;
 } TTEntry; 
+typedef struct {
+  TTEntry entries[BUCKET_SIZE];
+} TTBucket;
+
+
+typedef struct {
+
+    Move current_move;
+    Move killers[2];
+    Move excluded_move;
+    int eval;
+    uint8_t move_count; 
+    PieceType moved_piece;
+    PieceType cap_piece;
+    ContinuationHistory * ch;
+    ContinuationHistory * cr;
+    int stat_score;
+    uint8_t p_id;
+    uint8_t cap_id;
+
+} SearchStack;
+
+typedef struct {
+
+  uint64_t blockers_for_king[COLOR_MAX];
+  uint64_t check_sq[PIECE_TYPES];
+  
+} CheckInfo;
+
+typedef struct StateInfo{
+
+  uint64_t pinners[COLOR_MAX];
+
+  
+  uint64_t nonpawn_key[COLOR_MAX];
+  uint64_t material_key;
+  uint64_t piece_key[PIECE_TYPES];
+  Score psqt_score[COLOR_MAX];
+  Score material_score[COLOR_MAX];
+  uint8_t k_sq[COLOR_MAX];
+  uint8_t castle_flags;
+  int8_t en_passant_index;
+  int rule50;
+
+  uint64_t key;
+  CheckInfo ci;
+  struct StateInfo * pst;
+  
+} StateInfo;
+
+typedef struct EvalMasks {
+  
+  uint64_t am[COLOR_MAX];
+  uint64_t am_nk[COLOR_MAX];
+  // uint64_t am_np[COLOR_MAX];
+  uint64_t am_m[COLOR_MAX];
+  uint64_t am_xr_nq[COLOR_MAX];
+  uint64_t sppa[COLOR_MAX];
+  uint64_t safe[COLOR_MAX];
+  // uint64_t am_empty;
+  uint64_t am_p[COLOR_MAX][PIECE_TYPES];
+  uint64_t datk[COLOR_MAX];
+  uint64_t wsq[COLOR_MAX];
+  uint64_t out[COLOR_MAX];
+  uint64_t tdp[COLOR_MAX];
+  uint64_t passers[COLOR_MAX];
+  // uint64_t passers_front[COLOR_MAX];
+  // uint64_t passers_file[COLOR_MAX];
+
+} EvalMasks;
 
 typedef struct PawnHashEntry {
 
   uint64_t key;
-  float mg_score;
-  float eg_score;
-  float king_safety;
-  uint64_t w_pawn_attacks;
-  uint64_t b_pawn_attacks;
+  Score s;
+  uint64_t w_atk;
+  uint64_t b_atk;
+  uint64_t w_passers;
+  uint64_t b_passers;
   
 } PawnHashEntry;
 
@@ -421,32 +704,34 @@ typedef struct EvalEntry {
 
   uint64_t key;
   int eval;
-  int w_ktv;
-  int b_ktv;
+  Side side;
   
 } EvalEntry;
 
 
 typedef struct SearchFlags {
 
-  float max_time;
+  double max_time;
   bool check_hash;
   bool uci;
   bool mate;
+  bool draw;
   bool three_fold_repetition;
   bool use_opening_book;
+  int threads;
   int max_depth;
+  int nodes;
   
 } SearchFlags;
 
 typedef struct SearchData {
   
-  clock_t start_time; 
-  float max_time; // seconds
+  double start_time; 
+  double max_time; // seconds
   bool has_extended;
+  bool nodes_enabled;
+  int node_max;
 
-  Move killer_moves[64][2];
-  int64_t history[COLOR_MAX][64][64];
 
   Move pv_table[64][64];
   int pv_length[64];
@@ -481,6 +766,19 @@ typedef struct SearchData {
   int razoring;
   int check_extensions;
   int delta_prunes;
+  int qdelta_prunes;
+  int lazy_cutoffs_s1;
+  int lazy_cutoffs_s2;
+  int lazy_cutoffs_s3;
+  int highest_mat_reached;
+  int fast_evals;
+  int successful_iids;
+  int chist_prunes;
+  int check_prunes;
+  
+  float extensions;
+  float reductions;
+  bool enable_time;
 
   // to avoid pv shortening in small aspiration windows
   bool disable_writes;
@@ -492,7 +790,7 @@ typedef struct SearchData {
 
 typedef struct DatasetEntry {
   
-  char fen[MAX_FEN];
+  char fen[MAX_FEN + 20];
   double result;
   int param_count;
   long offset; // offset into extraction file
@@ -523,77 +821,158 @@ typedef struct DiscoveredSlider {
   PieceType p;
 } DiscoveredSlider;
 
+typedef struct PieceInfo {
+  
+  PieceType p;
+  Side side;
+  uint8_t pos;
+  bool alive;
+  
+} PieceInfo;
+
+typedef struct MobilityInfo {
+  uint64_t mask;
+  PieceType p;
+  uint8_t pos;
+} MobilityInfo;
+
+typedef struct MovePicker {
+
+  int16_t scores[256];
+  int16_t see_scores[256];
+  Move moves[256];
+  Move bcap[256];
+  uint8_t bcap_cnt;
+  uint8_t current_bcap;
+  uint8_t ordering[256];
+  uint8_t move_count;
+  uint8_t current_index;
+  PickType stage;
+  Move tt_move;
+  
+} MovePicker;
+
+
 
 typedef struct Game {
   
-  // Player player[2];
   int move_counter;
   Side side_to_move;
-  uint64_t key;
-  uint64_t pawn_key;
+
 
   uint64_t board_pieces[COLOR_MAX + 1];
-
-  bool castle_flags[COLOR_MAX][CASTLESIDE_MAX];
-  bool king_location_castle_side[COLOR_MAX][3];
         
-  int en_passant_index;
 
   int halfmove;
   int fullmove;
 
   uint64_t pieces[COLOR_MAX][PIECE_TYPES];
+
   PieceType piece_at[64];
+  
+
+  uint8_t piece_count[COLOR_MAX][PIECE_TYPES];
+  uint8_t piece_list[COLOR_MAX][PIECE_TYPES][PIECE_MAX];
+  uint8_t piece_index[BOARD_MAX];
+
 
   char fen[MAX_MOVES][MAX_FEN];
 
-
-  uint64_t * rook_table;
-  uint64_t * bishop_table;
-
-  int material_evaluation_mg[COLOR_MAX];
-  int material_evaluation_eg[COLOR_MAX];
-  int psqt_evaluation_mg[COLOR_MAX];
-  int psqt_evaluation_eg[COLOR_MAX];
-  int pawn_storm_evaluation_mg[COLOR_MAX][CASTLESIDE_MAX];
-  int pawn_storm_evaluation_eg[COLOR_MAX][CASTLESIDE_MAX];
-
-
-  uint64_t attack_mask[COLOR_MAX];
-  int mobility_score_mg[COLOR_MAX];
-  int mobility_score_eg[COLOR_MAX];
-  int king_threat_score[COLOR_MAX];
-  int valuable_attacker_score[COLOR_MAX];
-  
-  uint32_t countermove_table[COUNTERMOVE_TABLE_SIZE];
-  uint32_t refutation_table[REFUTATION_TABLE_SIZE];
-
   bool uci_mode;
   
-  TTEntry * tt;
-  PawnHashEntry * pawn_hash_table;
-  EvalEntry * eval_table;
-
-  int history_table[COLOR_MAX][64][64];
+  uint16_t gen;
 
   int phase;
 
-  OpeningBook opening_book;
-  
-
   uint64_t key_history[2048];
-  // Move move_history[2048];
-  Move last_move;
-  Move last_last_move;
+  bool has_valid_last_move;
   int history_count;
+
+  int fifty_move_clock;
+  int fifty_move_clock_was;
+
+  uint8_t piece_uid;
+
+  StateInfo os;
+  
+  StateInfo * st;
   
 } Game;
+
+typedef struct RootData {
+
+    Move move_list[256];
+    uint8_t move_count;
+
+    int alpha, beta;
+
+    _Atomic int next_index;
+
+    _Atomic int best_score;
+    _Atomic bool game_end;
+    Move best_move;
+    _Atomic int legal_moves;
+    _Atomic int node_count;
+
+    pthread_mutex_t pv_lock;
+    Move pv[64];
+    int pv_length;
+    
+    _Atomic bool stop;
+
+    pthread_mutex_t sd_lock;
+    SearchData sd;
+    
+} RootData;
+
+typedef struct ThreadData {
+
+  Game game;
+  SearchData search_data;
+  RootData * root;
+
+  StateInfo state_stack[1024];
+  int last_state;
+
+  int16_t history[COLOR_MAX][BOARD_MAX * BOARD_MAX];
+  int16_t cap_hist[PIECE_TYPES][BOARD_MAX][PIECE_TYPES + 1];
+  ContinuationHistory continuation_history[PIECE_TYPES + 1][BOARD_MAX];
+  ContinuationHistory contcorr[PIECE_TYPES + 1][BOARD_MAX];
+
+  int16_t corrhist_p[COLOR_MAX][CORRHIST_SIZE];
+  int16_t corrhist_nonpawns_w[COLOR_MAX][CORRHIST_SIZE];
+  int16_t corrhist_nonpawns_b[COLOR_MAX][CORRHIST_SIZE];
+  int16_t corrhist_material[COLOR_MAX][CORRHIST_SIZE];
+  int16_t corrhist_kbn[COLOR_MAX][CORRHIST_SIZE];
+  int16_t corrhist_kqr[COLOR_MAX][CORRHIST_SIZE];
+  
+  
+  uint8_t nmp_min_ply;
+  uint8_t nmp_side;
+
+  int id;
+  uint64_t seed;
+  
+} ThreadData;
+
+
+extern SearchParams sp;
+extern Score eval_params[2048];
+extern ParamIndex ep_idx;
+extern Score PSQT[COLOR_MAX][PIECE_TYPES][BOARD_MAX];
+
+extern uint64_t rook_table[ROOK_TABLE_SIZE];
+extern uint64_t bishop_table[BISHOP_TABLE_SIZE];
+extern TTBucket tt[TT_SIZE];
+extern PawnHashEntry pawn_hash_table[PAWN_SIZE];
+extern EvalEntry eval_table[EVAL_SIZE];
+extern uint64_t material_randoms[COLOR_MAX][PIECE_TYPES][12];
 
 
 extern int double_pushed_pawn_squares[COLOR_MAX][64];
 extern uint64_t pawn_shield_masks[COLOR_MAX][64];
 extern uint64_t adjacent_in_front_masks[COLOR_MAX][64];
-extern uint64_t king_zone_masks[64];
+extern uint64_t king_zone_masks[COLOR_MAX][64];
 
 // a mask used for determining if our rights will be lost when it's not our turn if one of our rooks gets captured from its starting location
 // extern const int rook_starting_locations[COLOR_MAX][2];
@@ -610,6 +989,195 @@ extern ParamIndex params;
 
 extern int MOBILITY_BLOCKER_VALUES[2][PIECE_TYPES][PIECE_TYPES];
 
+extern uint64_t castling_rights_masks[BOARD_MAX];
+
+static const uint64_t front[COLOR_MAX][BOARD_MAX] = {
+  {
+    256ULL,
+    512ULL,
+    1024ULL,
+    2048ULL,
+    4096ULL,
+    8192ULL,
+    16384ULL,
+    32768ULL,
+    65536ULL,
+    131072ULL,
+    262144ULL,
+    524288ULL,
+    1048576ULL,
+    2097152ULL,
+    4194304ULL,
+    8388608ULL,
+    16777216ULL,
+    33554432ULL,
+    67108864ULL,
+    134217728ULL,
+    268435456ULL,
+    536870912ULL,
+    1073741824ULL,
+    2147483648ULL,
+    4294967296ULL,
+    8589934592ULL,
+    17179869184ULL,
+    34359738368ULL,
+    68719476736ULL,
+    137438953472ULL,
+    274877906944ULL,
+    549755813888ULL,
+    1099511627776ULL,
+    2199023255552ULL,
+    4398046511104ULL,
+    8796093022208ULL,
+    17592186044416ULL,
+    35184372088832ULL,
+    70368744177664ULL,
+    140737488355328ULL,
+    281474976710656ULL,
+    562949953421312ULL,
+    1125899906842624ULL,
+    2251799813685248ULL,
+    4503599627370496ULL,
+    9007199254740992ULL,
+    18014398509481984ULL,
+    36028797018963968ULL,
+    72057594037927936ULL,
+    144115188075855872ULL,
+    288230376151711744ULL,
+    576460752303423488ULL,
+    1152921504606846976ULL,
+    2305843009213693952ULL,
+    4611686018427387904ULL,
+    9223372036854775808ULL,
+    0, 0, 0, 0, 0, 0, 0, 0
+  },
+  {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1ULL,
+    2ULL,
+    4ULL,
+    8ULL,
+    16ULL,
+    32ULL,
+    64ULL,
+    128ULL,
+    256ULL,
+    512ULL,
+    1024ULL,
+    2048ULL,
+    4096ULL,
+    8192ULL,
+    16384ULL,
+    32768ULL,
+    65536ULL,
+    131072ULL,
+    262144ULL,
+    524288ULL,
+    1048576ULL,
+    2097152ULL,
+    4194304ULL,
+    8388608ULL,
+    16777216ULL,
+    33554432ULL,
+    67108864ULL,
+    134217728ULL,
+    268435456ULL,
+    536870912ULL,
+    1073741824ULL,
+    2147483648ULL,
+    4294967296ULL,
+    8589934592ULL,
+    17179869184ULL,
+    34359738368ULL,
+    68719476736ULL,
+    137438953472ULL,
+    274877906944ULL,
+    549755813888ULL,
+    1099511627776ULL,
+    2199023255552ULL,
+    4398046511104ULL,
+    8796093022208ULL,
+    17592186044416ULL,
+    35184372088832ULL,
+    70368744177664ULL,
+    140737488355328ULL,
+    281474976710656ULL,
+    562949953421312ULL,
+    1125899906842624ULL,
+    2251799813685248ULL,
+    4503599627370496ULL,
+    9007199254740992ULL,
+    18014398509481984ULL,
+    36028797018963968ULL,
+  }
+};
+
+static const uint64_t bits[BOARD_MAX] = {
+  1ULL,
+  2ULL,
+  4ULL,
+  8ULL,
+  16ULL,
+  32ULL,
+  64ULL,
+  128ULL,
+  256ULL,
+  512ULL,
+  1024ULL,
+  2048ULL,
+  4096ULL,
+  8192ULL,
+  16384ULL,
+  32768ULL,
+  65536ULL,
+  131072ULL,
+  262144ULL,
+  524288ULL,
+  1048576ULL,
+  2097152ULL,
+  4194304ULL,
+  8388608ULL,
+  16777216ULL,
+  33554432ULL,
+  67108864ULL,
+  134217728ULL,
+  268435456ULL,
+  536870912ULL,
+  1073741824ULL,
+  2147483648ULL,
+  4294967296ULL,
+  8589934592ULL,
+  17179869184ULL,
+  34359738368ULL,
+  68719476736ULL,
+  137438953472ULL,
+  274877906944ULL,
+  549755813888ULL,
+  1099511627776ULL,
+  2199023255552ULL,
+  4398046511104ULL,
+  8796093022208ULL,
+  17592186044416ULL,
+  35184372088832ULL,
+  70368744177664ULL,
+  140737488355328ULL,
+  281474976710656ULL,
+  562949953421312ULL,
+  1125899906842624ULL,
+  2251799813685248ULL,
+  4503599627370496ULL,
+  9007199254740992ULL,
+  18014398509481984ULL,
+  36028797018963968ULL,
+  72057594037927936ULL,
+  144115188075855872ULL,
+  288230376151711744ULL,
+  576460752303423488ULL,
+  1152921504606846976ULL,
+  2305843009213693952ULL,
+  4611686018427387904ULL,
+  9223372036854775808ULL,
+};
 
 static const uint64_t pawn_moves[COLOR_MAX][BOARD_MAX] = {
   {
@@ -1161,6 +1729,14 @@ static const char piece_names[12] = {
     'K',
     'k'
 };
+static const char PNAME[6] = {
+    'P',
+    'N',
+    'B',
+    'R',
+    'Q',
+    'K',
+};
 
 static const char file_names[8] = {
     'a',
@@ -1204,14 +1780,14 @@ static const uint64_t one_and_two_file_mask = 0x303030303030303ULL;
 static const uint64_t seven_and_eight_file_mask = 0xc0c0c0c0c0c0c0c0ULL;
 
 static const uint64_t adjacent_file_masks[8] = {
-    
     0x202020202020202ULL,
     0x505050505050505ULL,
     0xa0a0a0a0a0a0a0aULL,
     0x1414141414141414ULL,
     0x2828282828282828ULL,
     0x5050505050505050ULL,
-    0xa0a0a0a0a0a0a0a0ULL
+    0xa0a0a0a0a0a0a0a0ULL,
+    0x4040404040404040ULL
 };
 static const uint64_t file_masks[8] = {
     
@@ -1224,6 +1800,13 @@ static const uint64_t file_masks[8] = {
     0x4040404040404040ULL,
     0x8080808080808080ULL,
     
+};
+
+static const uint64_t double_push_masks[2] = 
+{
+  
+    0xff000000ULL,
+    0xff00000000ULL,
 };
 
 static const uint64_t rank_masks[8] = {
@@ -1239,6 +1822,23 @@ static const uint64_t rank_masks[8] = {
     
 };
 
+// enemy territory 2 ranks
+static const uint64_t ET2[COLOR_MAX] = {
+  0xffff000000000000ULL,
+  0xffffULL
+};
+
+// enemy territory 3 ranks
+static const uint64_t ET3[COLOR_MAX] = {
+  0xffffff0000000000ULL,
+  0xffffffULL
+};
+
+static const uint64_t board_halves[COLOR_MAX] = {
+  0xffffffffULL,
+  0xffffffff00000000ULL
+};
+
 static const uint64_t promotion_ranks[COLOR_MAX] = {
     0xff00000000000000ULL, // black = rank 1
     0xffULL, // white = rank 8
@@ -1246,11 +1846,11 @@ static const uint64_t promotion_ranks[COLOR_MAX] = {
 
 static const uint64_t castle_masks[COLOR_MAX][CASTLESIDE_MAX] = {
     {
-        0x1eULL, // black queenside
-        0x70ULL  // black kingside
+        0x1cULL, // black queenside
+        0x70ULL // black kingside
     },
     {
-        0x1e00000000000000ULL, // white queenside
+        0x1c00000000000000ULL, // white queenside
         0x7000000000000000ULL  // white kingside
     },
 };
@@ -1295,6 +1895,11 @@ static const int rook_castle_locations[COLOR_MAX][CASTLESIDE_MAX][2] = {
     
     }
     
+};
+
+static const int king_end_locations[COLOR_MAX][CASTLESIDE_MAX] =
+{
+  {2, 6}, {58, 62}
 };
 static const int king_castle_locations[COLOR_MAX][CASTLESIDE_MAX][2] = {
     
@@ -1376,6 +1981,7 @@ static const int rook_starting_locations[COLOR_MAX][2] =
     {56, 63}
 };
 
+static const int king_starting_locations[COLOR_MAX] = {4, 60};
 static const int phase_values[PIECE_TYPES] = 
 {
     0,
@@ -1386,6 +1992,7 @@ static const int phase_values[PIECE_TYPES] =
     0
 };
 
+static const int PVAL[PIECE_TYPES+1] = {100, 330, 350, 500, 900, 0, 0};
 static const int piece_values_mg[PIECE_TYPES] = 
 {
     // pawns
@@ -1437,96 +2044,25 @@ static const int mvv_lva[PIECE_TYPES][PIECE_TYPES] =
     },
         
 };
-static const int MOBILITY_BONUS_MG[PIECE_TYPES] =
-{
-    // pawns
-    0,
-    // knights
-    4,
-    // bishops  
-    4,
-    // rooks
-    2,
-    // queens
-    1,
-    0
-};
-static const int MOBILITY_BONUS_EG[PIECE_TYPES] =
-{
-    // pawns
-    0,
-    // knights
-    3,
-    // bishops  
-    3,
-    // rooks
-    2,
-    // queens
-    2,
-    0
-};
 
-static const int PAWN_SPACE_FILE_WEIGHTS[8] =
-{
-    1,
-    1,
-    2,
-    2,
-    2,
-    2,
-    1,
-    1
-};
-static const int DOUBLED_PAWN_PENALTY_MG = -3;
-static const int DOUBLED_PAWN_PENALTY_EG = -2;
-static const int ISOLATED_PAWN_PENALTY_MG = -2;
-static const int ISOLATED_PAWN_PENALTY_EG = -3;
-static const int PASSED_PAWN_BONUS_MG = 3;
-static const int PASSED_PAWN_BONUS_EG = 8;
-static const int BACKWARD_PAWN_PENALTY_MG = -2;
-static const int BACKWARD_PAWN_PENALTY_EG = -3;
-static const int CANDIDATE_PASSER_BONUS_MG = 3;
-static const int CANDIDATE_PASSER_BONUS_EG = 5;
-static const int CHAINED_PAWN_BONUS_MG = 3;
-static const int CHAINED_PAWN_BONUS_EG = 3;
-static const int BISHOP_PAIR_BONUS = 15;
-static const int QUEEN_BISHOP_CONNECTED_BONUS = 3;
-static const int QUEEN_ROOK_CONNECTED_BONUS = 3;
 
-static const int ROOK_SEMI_OPEN_FILE_BONUS = 2;
-static const int ROOK_OPEN_FILE_BONUS = 3;
-static const int CONNECTED_ROOK_BONUS = 3;
-static const int SEMI_OPEN_FILE_NEAR_KING_PENALTY = -2;
-static const int OPEN_FILE_NEAR_KING_PENALTY = -3;
-static const int OPEN_MIDDLE_FILE_NEAR_KING_ADDITIONAL_PENALTY = -1;
-static const int OPEN_DIAGONAL_NEAR_KING_PENALTY = -2;
-static const int SEMI_OPEN_DIAGONAL_NEAR_KING_PENALTY = -1;
-static const int OPEN_DIAGONAL_FROM_KING_PENALTY = -3;
-static const int SEMI_OPEN_DIAGONAL_FROM_KING_PENALTY = -2;
-static const int PAWN_SHIELD_BONUS = 2;
-static const int PAWN_STORM_BONUS = 8;
-static const int DIST_TO_CENTER_BONUS = 2;
-static const int ATTACK_TEMPO_EVALUATION = 1;
-static const int PAWN_BLOCKERS_PENALTY = -1;
-static const int KING_ZONE_ATTACK_PENALTY = -5;
-static const int KING_ZONE_DEFENSE_SCORE = 2;
-static const int KING_ZONE_BATTERY_BONUS = 3;
-static const int DOUBLE_ATTACK_BONUS_MG = 1;
-static const int DOUBLE_ATTACK_BONUS_EG = 1;
-static const int PIN_PENALTY = -5;
-static const int PIN_ATTACKED_TWICE_PENALTY = -5;
-static const int OPEN_FILE_NEAR_KING_WITH_ATTACKER = -5;
-static const int OPEN_FILE_FROM_KING_WITH_ATTACKER = -7;
-static const int OPEN_DIAGONAL_NEAR_KING_WITH_ATTACKER = -3;
-static const int OPEN_DIAGONAL_FROM_KING_WITH_ATTACKER = -6;
-static const int HANGING_PIECE_PENALTY[PIECE_TYPES] =
-{
-    -1, -2, -3, -4, -5, 0
-};
-static const int STARTING_SQUARE_VALUES[PIECE_TYPES] =
-{
-    0, -3, -3, 0, 6, 0
-};
+
+static const uint64_t center_squares_mask = 0x3c3c3c3c0000ULL;
+
+
+extern int THREAT_SCORE[500];
+
+extern int KING_DANGER[1000];
+
+extern int KING_THREAT[1000];
+extern int PASSER_SCORE[200];
+
+extern int PSQT_SCALE[10000];
+
+extern int LMR_PV[64][64];
+extern int LMR_NON_PV[64][64];
+extern int LMP[64];
+extern int FP[64][64];
 static const uint64_t STARTING_SQUARES[COLOR_MAX][PIECE_TYPES] = 
 {
 {
@@ -1550,336 +2086,26 @@ static const uint64_t STARTING_SQUARES[COLOR_MAX][PIECE_TYPES] =
 }
 };
 
-static const int ATTACKING_HIGHER_VALUE_BONUS[PIECE_TYPES][PIECE_TYPES] =
+static const uint64_t COLOR_SQUARES[COLOR_MAX] = 
 {
-    
-    // pawns
-    {
-        0, // pxp
-        1, // pxk
-        2, // pxb
-        3, // pxr
-        5, // pxq
-        6, 
-    },
-    // knight
-    {
-        0, //kxp
-        0, //kxk
-        1, //kxb
-        1, //kxr
-        3, //kxq
-        6
-    },
-    // bishop
-    {
-        0, //kxp
-        0, //kxk
-        0, //kxb
-        2, //kxr
-        3, //kxq
-        6
-    },
-    // rook
-    {
-        0, //kxp
-        0, //kxk
-        0, //kxb
-        0, //kxr
-        3, //kxq
-        6
-    },
-    // queen
-    {
-        0, //kxp
-        0, //kxk
-        0, //kxb
-        0, //kxr
-        0, //kxq
-        2
-    },
-    // king
-    {
-        0, //kxp
-        0, //kxk
-        0, //kxb
-        0, //kxr
-        0, //kxq
-        0
-    },
-    
+  0x55aa55aa55aa55aaULL,
+  0xaa55aa55aa55aa55ULL
 };
 
-static const int PSQT_MG[COLOR_MAX][PIECE_TYPES][64] = 
-{
-    // black
-{
-
-    {
-      74, 74, 74, 74, 74, 74, 74, 74,
-      54, 68, 60, 57, 61, 74, 81, 57,
-      56, 62, 61, 61, 64, 66, 75, 60,
-      55, 66, 66, 70, 72, 68, 70, 55,
-      61, 71, 67, 72, 73, 71, 74, 59,
-      67, 69, 77, 80, 95, 94, 78, 63,
-      106, 122, 94, 114, 112, 122, 88, 65,
-      74, 74, 74, 74, 74, 74, 74, 74,
-    },
-    {
-      220, 253, 240, 247, 256, 251, 255, 251,
-      248, 241, 257, 259, 261, 266, 256, 254,
-      252, 256, 264, 265, 268, 266, 268, 255,
-      257, 266, 268, 266, 272, 270, 270, 259,
-      257, 270, 268, 280, 277, 280, 270, 269,
-      240, 279, 275, 283, 294, 309, 288, 277,
-      227, 236, 279, 270, 266, 282, 257, 250,
-      182, 228, 246, 245, 273, 222, 248, 213,
-    },
-    {
-      295, 309, 309, 302, 306, 305, 292, 297,
-      305, 315, 312, 308, 310, 314, 320, 305,
-      306, 313, 313, 314, 314, 318, 313, 310,
-      303, 315, 315, 320, 325, 311, 311, 309,
-      305, 308, 316, 328, 322, 326, 307, 309,
-      309, 325, 323, 324, 321, 331, 328, 319,
-      298, 309, 299, 299, 317, 328, 310, 289,
-      287, 308, 271, 283, 290, 288, 307, 301,
-    },
-    {
-      391, 393, 396, 399, 400, 400, 385, 390,
-      384, 396, 394, 398, 401, 408, 403, 376,
-      383, 392, 395, 393, 399, 400, 399, 388,
-      384, 388, 395, 396, 398, 396, 407, 389,
-      386, 393, 398, 406, 401, 411, 394, 389,
-      393, 404, 408, 407, 401, 416, 421, 400,
-      405, 407, 420, 422, 427, 427, 401, 411,
-      405, 413, 403, 414, 414, 401, 402, 406,
-    },
-    {
-      809, 806, 809, 819, 805, 802, 797, 789,
-      795, 806, 814, 810, 813, 816, 811, 809,
-      804, 813, 806, 807, 808, 811, 816, 813,
-      809, 800, 806, 805, 808, 809, 811, 811,
-      798, 800, 805, 804, 805, 818, 809, 813,
-      807, 807, 809, 814, 821, 839, 834, 834,
-      800, 792, 808, 815, 801, 828, 816, 823,
-      792, 807, 816, 811, 833, 826, 820, 818,
-    },
-    {
-      -2, 18, 11, -15, -7, -13, 15, 12,
-      6, 6, -5, -32, -24, -11, 9, 10,
-      3, 0, -15, -33, -34, -26, -9, -11,
-      -10, 7, -11, -29, -35, -25, -16, -26,
-      0, -3, 2, -8, -7, -8, -5, -25,
-      14, 11, 18, 5, 6, 17, 15, 0,
-      15, 10, 10, 15, 7, 4, -4, -12,
-      -4, 30, 23, 13, -15, -6, 9, 9,
-    },
-      
-},
-{
-    {
-        74, 74, 74, 74, 74, 74, 74, 74, 
-        106, 122, 94, 114, 112, 122, 88, 65, 
-        67, 69, 77, 80, 95, 94, 78, 63, 
-        61, 71, 67, 72, 73, 71, 74, 59, 
-        55, 66, 66, 70, 72, 68, 70, 55, 
-        56, 62, 61, 61, 64, 66, 75, 60, 
-        54, 68, 60, 57, 61, 74, 81, 57, 
-        74, 74, 74, 74, 74, 74, 74, 74,
-    },
-    {
-        182, 228, 246, 245, 273, 222, 248, 213, 
-        227, 236, 279, 270, 266, 282, 257, 250, 
-        240, 279, 275, 283, 294, 309, 288, 277, 
-        257, 270, 268, 280, 277, 280, 270, 269, 
-        257, 266, 268, 266, 272, 270, 270, 259, 
-        252, 256, 264, 265, 268, 266, 268, 255, 
-        248, 241, 257, 259, 261, 266, 256, 254, 
-        220, 253, 240, 247, 256, 251, 255, 251,
-    },
-    {
-        287, 308, 271, 283, 290, 288, 307, 301, 
-        298, 309, 299, 299, 317, 328, 310, 289, 
-        309, 325, 323, 324, 321, 331, 328, 319, 
-        305, 308, 316, 328, 322, 326, 307, 309, 
-        303, 315, 315, 320, 325, 311, 311, 309, 
-        306, 313, 313, 314, 314, 318, 313, 310, 
-        305, 315, 312, 308, 310, 314, 320, 305, 
-        295, 309, 309, 302, 306, 305, 292, 297,
-    },
-    {
-        405, 413, 403, 414, 414, 401, 402, 406, 
-        405, 407, 420, 422, 427, 427, 401, 411, 
-        393, 404, 408, 407, 401, 416, 421, 400, 
-        386, 393, 398, 406, 401, 411, 394, 389, 
-        384, 388, 395, 396, 398, 396, 407, 389, 
-        383, 392, 395, 393, 399, 400, 399, 388, 
-        384, 396, 394, 398, 401, 408, 403, 376, 
-        391, 393, 396, 399, 400, 400, 385, 390,
-    },
-    {
-        792, 807, 816, 811, 833, 826, 820, 818, 
-        800, 792, 808, 815, 801, 828, 816, 823, 
-        807, 807, 809, 814, 821, 839, 834, 834, 
-        798, 800, 805, 804, 805, 818, 809, 813, 
-        809, 800, 806, 805, 808, 809, 811, 811, 
-        804, 813, 806, 807, 808, 811, 816, 813, 
-        795, 806, 814, 810, 813, 816, 811, 809, 
-        809, 806, 809, 819, 805, 802, 797, 789,
-    },
-    {
-        -4, 30, 23, 13, -15, -6, 9, 9, 
-        15, 10, 10, 15, 7, 4, -4, -12, 
-        14, 11, 18, 5, 6, 17, 15, 0, 
-        0, -3, 2, -8, -7, -8, -5, -25, 
-        -10, 7, -11, -29, -35, -25, -16, -26, 
-        3, 0, -15, -33, -34, -26, -9, -11, 
-        6, 6, -5, -32, -24, -11, 9, 10, 
-        -2, 18, 11, -15, -7, -13, 15, 12, 
-    },
-}
-};
-
-static const int PSQT_EG[COLOR_MAX][PIECE_TYPES][64] = 
-{
-    // black
-{
-
-    {
-      79, 79, 79, 79, 79, 79, 79, 79,
-      82, 79, 78, 78, 79, 75, 75, 73,
-      78, 78, 73, 76, 74, 72, 73, 72,
-      82, 80, 75, 74, 77, 78, 76, 76,
-      91, 86, 83, 80, 76, 79, 83, 83,
-      117, 120, 114, 118, 112, 110, 123, 123,
-      154, 151, 143, 133, 138, 135, 148, 157,
-      79, 79, 79, 79, 79, 79, 79, 79,
-    },
-    {
-      215, 207, 217, 220, 219, 218, 208, 200,
-      211, 218, 222, 225, 225, 219, 218, 209,
-      217, 225, 226, 230, 229, 224, 218, 216,
-      219, 224, 232, 235, 233, 232, 228, 219,
-      221, 226, 234, 235, 234, 232, 228, 220,
-      215, 220, 230, 230, 226, 224, 219, 211,
-      215, 224, 219, 227, 224, 217, 218, 206,
-      206, 208, 222, 214, 217, 214, 202, 189,
-    },
-    {
-      251, 257, 255, 259, 258, 256, 257, 254,
-      254, 254, 257, 261, 261, 257, 254, 248,
-      254, 258, 263, 262, 264, 258, 257, 252,
-      256, 258, 263, 264, 260, 261, 257, 256,
-      258, 262, 263, 263, 264, 262, 259, 260,
-      257, 256, 259, 257, 259, 261, 259, 258,
-      256, 258, 261, 256, 259, 256, 258, 253,
-      256, 251, 255, 257, 258, 257, 255, 251,
-    },
-    {
-      419, 422, 422, 421, 420, 420, 422, 414,
-      421, 421, 424, 425, 422, 422, 419, 422,
-      423, 424, 423, 425, 422, 422, 422, 418,
-      425, 427, 427, 425, 424, 424, 421, 421,
-      424, 424, 427, 423, 424, 424, 423, 425,
-      424, 424, 422, 423, 423, 421, 421, 421,
-      425, 425, 424, 424, 419, 422, 425, 423,
-      425, 423, 426, 424, 424, 426, 425, 424,
-    },
-    {
-      763, 763, 765, 757, 776, 765, 771, 760,
-      772, 768, 762, 770, 770, 766, 763, 764,
-      774, 766, 783, 781, 783, 787, 783, 779,
-      766, 789, 787, 798, 791, 792, 791, 784,
-      780, 787, 785, 795, 804, 793, 803, 790,
-      767, 778, 780, 797, 795, 784, 779, 775,
-      772, 788, 788, 790, 803, 783, 781, 774,
-      776, 784, 787, 788, 783, 780, 779, 787,
-    },
-    {
-      -23, -17, -13, -4, -11, -6, -11, -21,
-      -13, -7, 2, 6, 6, -2, -5, -8,
-      -11, -3, 4, 10, 11, 6, 1, -5,
-      -10, -5, 7, 10, 13, 8, 2, -5,
-      -6, 4, 7, 10, 12, 10, 6, 0,
-      -1, 3, 6, 9, 10, 11, 12, 3,
-      -7, 2, 3, 4, 5, 11, 7, 4,
-      -32, -18, -9, -10, -4, 4, 0, -5,
-    },
-
-},
-{
-    {
-        79, 79, 79, 79, 79, 79, 79, 79, 
-        154, 151, 143, 133, 138, 135, 148, 157, 
-        117, 120, 114, 118, 112, 110, 123, 123, 
-        91, 86, 83, 80, 76, 79, 83, 83, 
-        82, 80, 75, 74, 77, 78, 76, 76, 
-        78, 78, 73, 76, 74, 72, 73, 72, 
-        82, 79, 78, 78, 79, 75, 75, 73, 
-        79, 79, 79, 79, 79, 79, 79, 79,
-    },
-    {
-        206, 208, 222, 214, 217, 214, 202, 189, 
-        215, 224, 219, 227, 224, 217, 218, 206, 
-        215, 220, 230, 230, 226, 224, 219, 211, 
-        221, 226, 234, 235, 234, 232, 228, 220, 
-        219, 224, 232, 235, 233, 232, 228, 219, 
-        217, 225, 226, 230, 229, 224, 218, 216, 
-        211, 218, 222, 225, 225, 219, 218, 209, 
-        215, 207, 217, 220, 219, 218, 208, 200,
-    },
-    {
-        256, 251, 255, 257, 258, 257, 255, 251, 
-        256, 258, 261, 256, 259, 256, 258, 253, 
-        257, 256, 259, 257, 259, 261, 259, 258, 
-        258, 262, 263, 263, 264, 262, 259, 260, 
-        256, 258, 263, 264, 260, 261, 257, 256, 
-        254, 258, 263, 262, 264, 258, 257, 252, 
-        254, 254, 257, 261, 261, 257, 254, 248, 
-        251, 257, 255, 259, 258, 256, 257, 254,
-    },
-    {
-        425, 423, 426, 424, 424, 426, 425, 424, 
-        425, 425, 424, 424, 419, 422, 425, 423, 
-        424, 424, 422, 423, 423, 421, 421, 421, 
-        424, 424, 427, 423, 424, 424, 423, 425, 
-        425, 427, 427, 425, 424, 424, 421, 421, 
-        423, 424, 423, 425, 422, 422, 422, 418, 
-        421, 421, 424, 425, 422, 422, 419, 422, 
-        419, 422, 422, 421, 420, 420, 422, 414,
-    },
-    {
-        776, 784, 787, 788, 783, 780, 779, 787, 
-        772, 788, 788, 790, 803, 783, 781, 774, 
-        767, 778, 780, 797, 795, 784, 779, 775, 
-        780, 787, 785, 795, 804, 793, 803, 790, 
-        766, 789, 787, 798, 791, 792, 791, 784, 
-        774, 766, 783, 781, 783, 787, 783, 779, 
-        772, 768, 762, 770, 770, 766, 763, 764, 
-        763, 763, 765, 757, 776, 765, 771, 760,
-    },
-    {
-        -32, -18, -9, -10, -4, 4, 0, -5, 
-        -7, 2, 3, 4, 5, 11, 7, 4, 
-        -1, 3, 6, 9, 10, 11, 12, 3, 
-        -6, 4, 7, 10, 12, 10, 6, 0, 
-        -10, -5, 7, 10, 13, 8, 2, -5, 
-        -11, -3, 4, 10, 11, 6, 1, -5, 
-        -13, -7, 2, 6, 6, -2, -5, -8, 
-        -23, -17, -13, -4, -11, -6, -11, -21, 
-    },
-}
-};
+extern int PSQT_MG[COLOR_MAX][PIECE_TYPES][64];
+extern int PSQT_EG[COLOR_MAX][PIECE_TYPES][64];
 
 
 extern int PAWN_STORM_PSQT_MG[COLOR_MAX][64];
 extern int PAWN_STORM_PSQT_EG[COLOR_MAX][64];
 
+extern uint64_t between_sq[64][64];
 
 extern const uint8_t center_manhattan_distance[64];
 
 
+extern StateInfo state_stack[1024];
+extern int st_idx;
 
 extern const MagicEntry ROOK_MAGICS[BOARD_MAX];
 extern const MagicEntry BISHOP_MAGICS[BOARD_MAX];
@@ -1900,7 +2126,7 @@ extern int SQ_TO_RANK[64];
 extern uint64_t in_front_file_masks[COLOR_MAX][64];
 
 // rank inversion
-inline int flip_square(int sq) {
+static inline int flip_square(int sq) {
     return sq ^ 56;
 }
 

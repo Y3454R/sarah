@@ -7,189 +7,6 @@
 #include "zobrist.h"
 
 
-// void generate_pawn_boards(Game * game){
-
-
-//     for (int i = 0; i < 16; i++){
-//         pawn_moves[BLACK][i] = 
-//             set_bit(0, i + 8) | set_bit(0, i + 16);
-
-//         if (i % 8 == 0){
-
-//             game->pawn_captures[BLACK][i] = 
-//                 set_bit(0, i + 9);
-            
-//         } else if (i % 8 == 7){
-            
-//             game->pawn_captures[BLACK][i] = 
-//                 set_bit(0, i + 7);
-
-//         } else {
-            
-//             game->pawn_captures[BLACK][i] = 
-//                 set_bit(0, i + 7) | set_bit(0, i + 9);
-
-//         }
-//     }
-
-//     for (int i = 16; i < 56; i++){
-        
-//         pawn_moves[BLACK][i] = 
-//             set_bit(0, i + 8);
-
-//         if (i % 8 == 0){
-            
-//             game->pawn_captures[BLACK][i] = 
-//                 set_bit(0, i + 9);
-
-//         } else if (i % 8 == 7){
-            
-//             game->pawn_captures[BLACK][i] = 
-//                 set_bit(0, i + 7);
-
-//         } else {
-            
-//             game->pawn_captures[BLACK][i] = 
-//                 set_bit(0, i + 7) | set_bit(0, i + 9);
-
-//         }
-
-//     }
-    
-
-//     for (int i = BOARD_MAX - 1; i > 47; i--){
-
-//         pawn_moves[WHITE][i] = 
-//             set_bit(0, i - 8) | set_bit(0, i - 16);
-
-//         if (i % 8 == 7){
-
-//             game->pawn_captures[WHITE][i] = 
-//                 set_bit(0, i - 9);
-            
-//         } else if (i % 8 == 0){
-            
-//             game->pawn_captures[WHITE][i] = 
-//                 set_bit(0, i - 7);
-
-//         } else {
-            
-//             game->pawn_captures[WHITE][i] = 
-//                 set_bit(0, i - 7) | set_bit(0, i - 9);
-
-//         }
-
-//     }
-
-//     for (int i = 47; i > 7; i--){
-        
-//         pawn_moves[WHITE][i] = 
-//             set_bit(0, i - 8);
-
-//         if (i % 8 == 0){
-
-//             game->pawn_captures[WHITE][i] = 
-//                 set_bit(0, i - 7);
-            
-//         } else if (i % 8 == 7){
-            
-//             game->pawn_captures[WHITE][i] = 
-//                 set_bit(0, i - 9);
-
-//         } else {
-            
-//             game->pawn_captures[WHITE][i] = 
-//                 set_bit(0, i - 7) | set_bit(0, i - 9);
-
-//         }
-
-//     }
-    
-// }
-
-// void generate_knight_boards(Game * game){
-    
-//     int moves[8] = {-10, -17, -15, -6, 10, 17, 15, 6};
-
-//     for (int i = 0; i < 64; i++){
-//         game->knight_moves[i] = 0;
-//         uint64_t current_position = set_bit(0, i);
-//         for (int s = 0; s < 8; s++){
-//             int proposed_index = i + moves[s];
-//             if (proposed_index >= 0 && proposed_index < BOARD_MAX){
-                
-//                 // this checks against opposite files to make sure we don't loop the board
-//                 uint64_t proposed_move = set_bit(0, proposed_index);
-//                 if (current_position & one_and_two_file_mask){
-
-//                     if (proposed_move & file_masks[FILE_H] || proposed_move & file_masks[FILE_G]){
-//                         continue;
-//                     }
-                    
-//                 } else if (current_position & seven_and_eight_file_mask){
-                    
-//                     if (proposed_move & file_masks[FILE_A] || proposed_move & file_masks[FILE_B]){
-//                         continue;
-//                     }
-
-//                 }
-
-//                 game->knight_moves[i] = game->knight_moves[i] | proposed_move;
-                
-//             }
-//         }
-//     }
-// }
-
-// void generate_king_boards(Game * game){
-    
-//     int moves[8] = {-9, -8, -7, -1, 1, 7, 8, 9};
-
-//     for (int i = 0; i < 64; i++){
-//         game->king_moves[i] = 0;
-//         uint64_t current_position = 1ULL << i;
-//         for (int s = 0; s < 8; s++){
-//             int proposed_index = i + moves[s];
-//             if (proposed_index >= 0 && proposed_index < BOARD_MAX){
-                
-//                 // this checks against opposite files to make sure we don't loop the board
-//                 uint64_t proposed_move = set_bit(0, proposed_index);
-//                 if (current_position & one_and_two_file_mask){
-
-//                     if (proposed_move & file_masks[FILE_H]){
-//                         continue;
-//                     }
-                    
-//                 } else if (current_position & seven_and_eight_file_mask){
-                    
-//                     if (proposed_move & file_masks[FILE_A]){
-//                         continue;
-//                     }
-
-//                 }
-
-//                 game->king_moves[i] = game->king_moves[i] | proposed_move;
-                
-//             }
-//         }
-//         // print_board(game->king_moves[i], K);
-//     }
-// }
-
-// void generate_bishop_boards(Game * game){
-
-//     for (int i = 0; i < BOARD_MAX; i++){
-        
-//         game->bishop_moves[i] = generate_slider_moves((ivec2[]){{-1, -1}, {-1, 1}, {1, 1}, {1, -1}}, i, 0);
-//     }
-    
-// }
-// void generate_rook_boards(Game * game){
-//     for (int i = 0; i < BOARD_MAX; i++){
-        
-//         game->rook_moves[i] = generate_slider_moves((ivec2[]){{-1, 0}, {0, 1}, {1, 0}, {0, -1}}, i, 0);
-//     }
-// }
 
 
 void update_blocker_masks(Game * game){
@@ -223,29 +40,14 @@ void update_blocker_masks(Game * game){
 
 // flips psqt for black
 void init_psqt(Game * game){
-    // int initial_offsets[PIECE_TYPES][2] = {{82,94}, {337,281}, {365,297}, {477,512}, {1025,936}, {0,0}};
-    // for (int p = 0; p < PIECE_TYPES; p++){
-    //     for (int i = 0; i < 64; i++){
-    //         PSQT_MG[WHITE][p][i] += initial_offsets[p][0];
-    //         PSQT_EG[WHITE][p][i] += initial_offsets[p][1];
-    //     }
-    // }
 
     // black (flip ranks)
     for (int i = 0;  i < PIECE_TYPES; i++){
         for (int r = 0; r < 8; r++){
             for (int f = 0; f < 8; f++){
-                // PSQT_MG[BLACK][i][r * 8 + f] = PSQT_MG[WHITE][i][abs(r - 7) * 8 + f];
-                // PSQT_EG[BLACK][i][r * 8 + f] = PSQT_EG[WHITE][i][abs(r - 7) * 8 + f];
-                PAWN_STORM_PSQT_MG[BLACK][r * 8 + f] = PAWN_STORM_PSQT_MG[WHITE][abs(r - 7) * 8 + f];
-                PAWN_STORM_PSQT_EG[BLACK][r * 8 + f] = PAWN_STORM_PSQT_EG[WHITE][abs(r - 7) * 8 + f];
+                PSQT_MG[BLACK][i][r * 8 + f] = PSQT_MG[WHITE][i][abs(r - 7) * 8 + f];
+                PSQT_EG[BLACK][i][r * 8 + f] = PSQT_EG[WHITE][i][abs(r - 7) * 8 + f];
             }
-        }
-    }
-    for (int r = 0; r < 8; r++){
-        for (int f = 0; f < 8; f++){
-            PAWN_STORM_PSQT_MG[BLACK][r * 8 + f] = PAWN_STORM_PSQT_MG[WHITE][abs(r - 7) * 8 + f];
-            PAWN_STORM_PSQT_EG[BLACK][r * 8 + f] = PAWN_STORM_PSQT_EG[WHITE][abs(r - 7) * 8 + f];
         }
     }
 }
@@ -398,12 +200,8 @@ void init_manhattan_dist(){
     for (int i = 0; i < 64; i++){
         for (int x = 0; x < 64; x++){
             manhattan_distance[i][x] = manhattanDistance(i, x);
-            // if (manhattan_distance[i][x] > max_dist){
-            //     max_dist = manhattan_distance[i][x];
-            // }
         }
     }
-    // printf("MAX DIST: %d\n", max_dist);
 }
 
 void init_pawn_randoms(){
@@ -411,12 +209,20 @@ void init_pawn_randoms(){
 
     for (int side = 0; side < 2; side++) {
         for (int sq = 0; sq < 64; sq++) {
-            pawn_random[side][sq] = splitmix64(&seed);
+            piece_random[side][sq] = splitmix64(&seed);
+        }
+    }
+    for (int side = 0; side < 2; side++) {
+        for (int p = 0; p < PIECE_TYPES; p++) {
+            for (int c = 0; c < 12; c++){
+                
+                material_randoms[side][p][c] = splitmix64(&seed);
+            }
         }
     }
 
     for (int side = 0; side < COLOR_MAX; side++) {
-        for (int z = 0; z < 3; z++) { 
+        for (int z = 0; z < 64; z++) { 
             king_location_random[side][z] = splitmix64(&seed);
         }
     }
@@ -466,62 +272,36 @@ void init_assorted_masks(Game * game){
         }
     }
 
-    // king zone
+    
     for (int i = 0; i < 64; i ++){
         int file = i % 8;
         int rank = i / 8;
-        uint64_t zone = king_moves[i];
-        if (file - 2 >= 0){
-            zone |= 1ULL << (i - 2);
-            if (rank - 1 >= 0){
-                zone |= 1ULL << (i - 10);
-            }
-            if (rank + 1 <= 7){
-                zone |= 1ULL << (i + 6);
-            }
-        }
-        if (file + 2 <= 7){
-            zone |= 1ULL << (i + 2);
-            if (rank - 1 >= 0){
-                zone |= 1ULL << (i - 6);
-            }
-            if (rank + 1 <= 7){
-                zone |= 1ULL << (i + 10);
-            }
-        }
+        uint64_t w_zone = king_moves[i];
+        uint64_t b_zone = king_moves[i];
+
         if (rank - 2 >= 0){
-            zone |= 1ULL << (i - 16);
+            w_zone |= 1ULL << (i - 16);
             if (file - 1 >= 0){
-                zone |= 1ULL << (i - 17);
-            }
-            if (file - 2 >= 0){
-                zone |= 1ULL << (i - 18);
+                w_zone |= 1ULL << (i - 17);
             }
             if (file + 1 <= 7){
-                zone |= 1ULL << (i - 15);
-            }
-            if (file + 2 <= 7){
-                zone |= 1ULL << (i - 14);
+                w_zone |= 1ULL << (i - 15);
             }
         }
         if (rank + 2 <= 7){
             
-            zone |= 1ULL << (i + 16);
+            b_zone |= 1ULL << (i + 16);
             if (file - 1 >= 0){
-                zone |= 1ULL << (i + 15);
-            }
-            if (file - 2 >= 0){
-                zone |= 1ULL << (i + 14);
+                b_zone |= 1ULL << (i + 15);
             }
             if (file + 1 <= 7){
-                zone |= 1ULL << (i + 17);
-            }
-            if (file + 2 <= 7){
-                zone |= 1ULL << (i + 18);
+                b_zone |= 1ULL << (i + 17);
             }
         }
-        king_zone_masks[i] = zone;
-        // print_board(zone, WHITE_KING);
+        king_zone_masks[WHITE][i] = w_zone;
+        king_zone_masks[BLACK][i] = b_zone;
+        // print_board(w_zone, WHITE_KING);
+        // print_board(b_zone, WHITE_KING);
     }
 
     for (int c = 0; c < COLOR_MAX; c++){
@@ -553,6 +333,56 @@ void init_assorted_masks(Game * game){
         }
     }
 
+
+
+    for (int a = 0; a < 64; a++) {
+        for (int b = 0; b < 64; b++) {
+            between_sq[a][b] = 0;
+
+            if (a == b)
+                continue;
+
+            for (int d = 0; d < 4; d++) {
+                if (!(DIAGONAL_RAYS[d][a] & (1ULL << b)))
+                    continue;
+
+                uint64_t bb = DIAGONAL_RAYS[d][a];
+
+                bb &= ~DIAGONAL_RAYS[d][b];
+
+                bb &= ~(1ULL << b);
+                bb &= ~(1ULL << a);
+
+                between_sq[a][b] = bb;
+                break;
+            }
+            for (int l = 0; l < 4; l++) {
+                if (!(LATERAL_RAYS[l][a] & (1ULL << b)))
+                    continue;
+
+                uint64_t bb = LATERAL_RAYS[l][a];
+
+                bb &= ~LATERAL_RAYS[l][b];
+
+                bb &= ~(1ULL << b);
+                bb &= ~(1ULL << a);
+
+                between_sq[a][b] = bb;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < 64; i++){
+        castling_rights_masks[i] = 0;
+    }
+
+    castling_rights_masks[0] = CBQ;
+    castling_rights_masks[4] = CBQ | CBK;
+    castling_rights_masks[7] = CBK;
+    castling_rights_masks[56] = CWQ;
+    castling_rights_masks[60] = CWQ | CWK;
+    castling_rights_masks[63] = CWK;
     
 }
 
@@ -564,7 +394,7 @@ void init_piece_boards(Game * game){
     // generate_knight_boards(game);
     // generate_king_boards(game);
     init_sliding_piece_tables(game);
-    // init_directional_ray_tables();
+    init_directional_ray_tables();
     // generate_bishop_boards(game);
     // generate_rook_boards(game);
     init_psqt(game);
