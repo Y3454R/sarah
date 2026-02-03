@@ -14,8 +14,8 @@ countermove table */
 
 
 extern const uint64_t Random64[781];
-extern uint64_t pawn_random[COLOR_MAX][64];
-extern uint64_t king_location_random[COLOR_MAX][3];
+extern uint64_t piece_random[COLOR_MAX][64];
+extern uint64_t king_location_random[COLOR_MAX][64];
 
 extern int polyglot_piece_types[COLOR_MAX][PIECE_TYPES];
 extern int polyglot_castle_offsets[COLOR_MAX][CASTLESIDE_MAX];
@@ -27,7 +27,11 @@ void reset_pawn_hash(Game * game);
 void init_eval_table(Game * game);
 void reset_eval_table(Game * game);
 void reset_countermove_and_refutation_tables(Game * game);
+void reset_corrhist(Game * game);
 
+uint64_t create_material_hash_from_scratch(Game * game);
+uint64_t create_nonpawn_hash_from_scratch(Game * game, Side side);
+uint64_t create_piece_hash_from_scratch(Game * game, PieceType p);
 uint64_t create_pawn_hash_from_scratch(Game * game);
 
 static inline size_t pawn_hash_index(uint64_t key){
@@ -41,57 +45,51 @@ static inline size_t eval_hash_index(uint64_t key){
 }
 
 
-/* @brief packs moves to 32 bit */
-static inline uint32_t pack_move(Move *m){
-    uint32_t mv = 0;
-    mv |= (m->start_index & 0x3F) << 0; 
-    mv |= (m->end_index & 0x3F) << 6; 
-    mv |= (m->promotion_type & 0x7) << 12; 
-    mv |= (m->type & 0x3) << 15; 
-    return mv;
-}
-/* @brief unpack moves from 32 bit */
-static inline void unpack_move(uint32_t mv, Move *out){
-    out->start_index = (mv >> 0) & 0x3F;
-    out->end_index = (mv >> 6) & 0x3F;
-    out->promotion_type = (PieceType)((mv >> 12) & 0x7);
-    out->type = (MoveType)((mv >> 15) & 0x3);
-}
-
-
 static inline TTEntry * search_for_tt_entry(Game * game, uint64_t key){
   size_t hashed_index = tt_hash_index(key);
-  TTEntry * possible_entry = &game->tt[hashed_index];
-  if (key == possible_entry->key){
-    // possible_entry->age = 0;
-    return possible_entry;
-  } else {
-    return NULL;
-  }
+  TTBucket * possible_entry = &tt[hashed_index];
+  // for (int i = 0; i < 4; i++){
+    if (key == possible_entry->entries[0].key ){
+      return &possible_entry->entries[0];
+    }
+    
+  // }
+    
+  return NULL;
 }
 
+static inline void reset_piece_keys(Game * game){
+  
+
+    game->os.piece_key[PAWN] = 0;
+    game->os.piece_key[KNIGHT] = 0;
+    game->os.piece_key[BISHOP] = 0;
+    game->os.piece_key[ROOK] = 0;
+    game->os.piece_key[QUEEN] = 0;
+    game->os.piece_key[KING] = 0;
+}
 
 static inline PawnHashEntry * search_for_pawn_hash_entry(Game * game, uint64_t key){
   size_t index = pawn_hash_index(key);
-  if (key == game->pawn_hash_table[index].key){
-    return &game->pawn_hash_table[index];
+  if (key == pawn_hash_table[index].key){
+    return &pawn_hash_table[index];
   } else {
     return NULL;
   }
 }
 
-static inline void create_new_pawn_hash_entry(Game * game, uint64_t key, float mg_score, float eg_score, float king_safety, uint64_t w_pawn_attacks, uint64_t b_pawn_attacks){
+static inline void create_new_pawn_hash_entry(Game * game, uint64_t key, Score s, EvalMasks * masks){
   
   size_t hashed_index = pawn_hash_index(key);
-  PawnHashEntry* entry = &game->pawn_hash_table[hashed_index];
-  // uint32_t key32 = (uint32_t)(key >> 32);
+  PawnHashEntry* entry = &pawn_hash_table[hashed_index];
 
-  game->pawn_hash_table[hashed_index] = (PawnHashEntry){
+  pawn_hash_table[hashed_index] = (PawnHashEntry){
     .key = key,
-    .mg_score = mg_score,
-    .eg_score = eg_score,
-    .w_pawn_attacks = w_pawn_attacks,
-    .b_pawn_attacks = b_pawn_attacks,
+    .s = s,
+    .w_atk = masks->am_p[WHITE][PAWN],
+    .b_atk = masks->am_p[BLACK][PAWN],
+    .w_passers = masks->passers[WHITE],
+    .b_passers = masks->passers[BLACK],
   };
 
 }
@@ -102,55 +100,81 @@ void init_opening_book(Game * game, const char * path);
 static inline int adjust_mate_score_from_tt(int score, int stored_ply, int current_ply) {
     if (score >= MATE_SCORE - 200 || score <= -MATE_SCORE + 200) {
         if (score > 0) {
-            return score - stored_ply + current_ply;
-        } else {
             return score + stored_ply - current_ply;
+        } else {
+            return score - stored_ply + current_ply;
         }
     }
     return score;
 }
-static inline void create_new_tt_entry(Game * game, uint64_t key, int score, TTType type, int depth, int16_t ply, Move * best_move){
+
+static inline TTEntry * get_replace_slot_from_bucket(Game * game, TTBucket * bucket, uint64_t key){
+  
+  int index = 0;
+  int lowest = INT_MAX;
+  for (int i = 0; i < BUCKET_SIZE; i++) {
+    TTEntry *e = &bucket->entries[i];
+    
+    if (e->key == 0 || e->key == key) {
+        index = i;
+        break;
+    }
+    
+    int score = e->depth - 4 * (game->gen - e->gen);
+    if (score < lowest) {
+        lowest = score;
+        index = i;
+    }
+  }
+  return &bucket->entries[index];
+}
+
+
+static inline void create_new_tt_entry(Game * game, uint64_t key, int score, TTType type, int16_t depth, uint8_t ply, Move move){
   
   size_t hashed_index = tt_hash_index(key);
-  TTEntry * entry = &game->tt[hashed_index];
-  bool has_eval = false;
-  if (entry->key == key){
-    if (entry->depth >= depth) return;
-  }
-  game->tt[hashed_index] = (TTEntry){
-    .key = key,
-    .score = score,
-    .depth = (int16_t)depth,
-    .type = (uint8_t)type,
-    .ply = ply,
-    .is_opening_book = false,
-    // .has_eval = has_eval,
-  };
-  if (best_move != NULL){
-    game->tt[hashed_index].move32 = pack_move(best_move);
-    game->tt[hashed_index].has_best_move = true;
-  } else {
-    game->tt[hashed_index].has_best_move = false;
-    game->tt[hashed_index].move32 = 0;
+  TTBucket * bucket = &tt[hashed_index];
+
+
+  // TTEntry * entry = get_replace_slot_from_bucket(game, bucket, key);
+  // TTEntry * entry = &tt[hashed_index];
+  TTEntry * entry = &bucket->entries[0];
+
+  if (key != entry->key ||
+      depth > entry->depth - 1 || type == EXACT || entry->type == UPPER){
+    bool has_eval = false;
+    *entry = (TTEntry){
+      .key = key,
+      .move = move,
+      .score = score,
+      .depth = (int16_t)depth,
+      .type = (uint8_t)type,
+      .ply = ply,
+      .gen = game->gen,
+      .is_opening_book = false,
+    };
   }
 
 }
 static inline EvalEntry * search_for_eval(Game * game, uint64_t key){
   
   size_t hashed_index = eval_hash_index(key);
-  EvalEntry * e = &game->eval_table[hashed_index];
+  EvalEntry * e = &eval_table[hashed_index];
   if (e->key == key){
     return e;
   }
   return NULL;
 }
 
-static inline void hash_eval(Game * game, uint64_t key, int eval){
+
+    
+static inline void hash_eval(Game * game, uint64_t key, int eval, Side side){
   size_t hashed_index = eval_hash_index(key);
-  EvalEntry * e = &game->eval_table[hashed_index];
+  EvalEntry * e = &eval_table[hashed_index];
 
   e->key = key;
   e->eval = eval;
+  e->side = side;
   
 }
 
@@ -171,52 +195,60 @@ static inline Move polyglot_decode(uint16_t m)
     int promo     = (m >> 12) & 0x7;
 
     Move move;
-    move.start_index = file_and_rank_to_index((File)from_file, (Rank)from_rank);
-    move.end_index = file_and_rank_to_index((File)to_file, (Rank)to_rank);
+    MoveType type = NORMAL;
+    uint8_t from = 0, to = 0;
+    PieceType promo_type = PIECE_NONE;
+    from = file_and_rank_to_index((File)from_file, (Rank)from_rank);
+    to = file_and_rank_to_index((File)to_file, (Rank)to_rank);
     if (promo != 0){
-      move.promotion_type = (PieceType)promo;
-      move.type = PROMOTION;
+      promo_type = (PieceType)promo;
+      type = PROMOTION;
     }
 
 
-    // due to polyglot convention, you MUST change castling moves to king moves
-    if (move.start_index == 60 && move.end_index == 63){
-      move.type = CASTLE;
-      move.castle_side = KINGSIDE;
-      move.start_index = 60;
-      move.end_index = 62;
+    // due to polyglot convention, change castling moves to king moves
+    if (from == 60 && to == 63){
+      type = CASTLE;
+      from = 60;
+      to = 62;
     } 
-    if (move.start_index == 60 && move.end_index == 56){
-      move.type = CASTLE;
-      move.castle_side = QUEENSIDE;
-      move.start_index = 60;
-      move.end_index = 58;
+    if (from == 60 && to == 56){
+      type = CASTLE;
+      from = 60;
+      to = 58;
       
     }
-    if (move.start_index == 4 && move.end_index == 0){
-      move.type = CASTLE;
-      move.castle_side = QUEENSIDE;
-      move.start_index = 4;
-      move.end_index = 2;
+    if (from == 4 && to == 0){
+      type = CASTLE;
+      from = 4;
+      to = 2;
       
     }
-    if (move.start_index == 4 && move.end_index == 7){
-      move.type = CASTLE;
-      move.castle_side = QUEENSIDE;
-      move.start_index = 4;
-      move.end_index = 6;
+    if (from == 4 && to == 7){
+      type = CASTLE;
+      from = 4;
+      to = 6;
+    }
+    if (type == PROMOTION){
+      move = create_promotion(from, to, promo_type);
+      
+    } else {
+      
+      move = create_move(from, to, type);
     }
     return move;
 }
 static inline void create_new_polyglot_entry(Game * game, uint64_t key, uint16_t weight, Move move){
 
   size_t hashed_index = tt_hash_index(key);
-  TTEntry * entry = &game->tt[hashed_index];
 
+  TTEntry * entry = get_replace_slot_from_bucket(game, &tt[hashed_index], key);
+  // TTEntry * entry = &tt[hashed_index];
 
-  game->tt[hashed_index] = (TTEntry){
+  *entry = (TTEntry){
     .key = key,
-    .move32 = pack_move(&move),
+    // .move32 = pack_move(&move),
+    .move = move,
     .depth = -20,
     .weight = weight,
     .is_opening_book = true,
@@ -231,7 +263,11 @@ static inline uint64_t get_piece_random(PieceType piece, Side side, int index){
   return Random64[(64 * polyglot_piece_types[side][piece]) + (8 * SQ_TO_RANK[index]) + SQ_TO_FILE[index]];
 }
 
-static inline uint64_t get_castling_random(Side side, CastleSide castle_side){
+static inline uint64_t get_castling_random(uint8_t bit){
+  return Random64[CASTLING_OFFSET + bit];
+}
+
+static inline uint64_t get_castling_randomr(Side side, CastleSide castle_side){
   return Random64[CASTLING_OFFSET + polyglot_castle_offsets[side][castle_side]];
 }
 
@@ -243,9 +279,11 @@ static inline uint64_t get_turn_random(){
 }
 
 uint64_t create_zobrist_from_scratch(Game * game);
+
 static inline bool check_hash(Game * game){
     uint64_t zob = create_zobrist_from_scratch(game);
-    return (zob == game->key);
+
+    return (zob == game->st->key);
 }
 
 static inline uint32_t mix32(uint32_t x){
@@ -253,24 +291,6 @@ static inline uint32_t mix32(uint32_t x){
     x *= 0x7feb352d;
     x ^= x >> 15;
     return x;
-}
-static inline uint32_t get_countermove(Game * game, Move * m) {
-    uint32_t idx = (size_t)(mix32(pack_move(m))) & (COUNTERMOVE_TABLE_SIZE - 1);
-    return game->countermove_table[idx];
-}
-
-static inline void store_countermove(Game * game, Move * p, Move * m) {
-    uint32_t idx = (size_t)(mix32(pack_move(p))) & (COUNTERMOVE_TABLE_SIZE - 1);
-    game->countermove_table[idx] = pack_move(m);
-}
-static inline uint32_t get_refutation(Game * game, Move * m) {
-    uint32_t idx = (size_t)(mix32(pack_move(m))) & (REFUTATION_TABLE_SIZE - 1);
-    return game->refutation_table[idx];
-}
-
-static inline void store_refutation(Game * game, Move * p, Move * m) {
-    uint32_t idx = (size_t)(mix32(pack_move(p))) & (REFUTATION_TABLE_SIZE - 1);
-    game->refutation_table[idx] = pack_move(m);
 }
 // to generate randoms for our hash tables
 static inline uint64_t splitmix64(uint64_t *state) {
