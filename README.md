@@ -29,11 +29,8 @@ Anyway, here's the brief summary:
 I did spend a while documenting stuff with all of these little @briefs and whatever. It is a bit of a mess due to the absurd amount of inlining though.
 
 Here's a todo list of the stuff that I'm working on:
-- Incrementalizing eval
-- Tuning search parameters and margins
-- Hand tuning psqts and eval terms further
 - Releasing a binary with actual commands and stuff
-- King safety influences pruning / reductions
+- My next project! Probably some graphics programming on some old hardware.
 
 I wanted to give a list here of projects and resources that I directly used in writing my engine:
 - https://github.com/yukarichess/
